@@ -39,6 +39,8 @@ class StorageSettings:
     price_prefix: str
     spread_prefix: str
     position_key: str
+    order_guard_prefix: str
+    order_record_prefix: str
 
     @classmethod
     def from_env(cls) -> "StorageSettings":
@@ -52,6 +54,8 @@ class StorageSettings:
             price_prefix=os.getenv("REDIS_PRICE_PREFIX", "prices"),
             spread_prefix=os.getenv("REDIS_SPREAD_PREFIX", "spreads"),
             position_key=os.getenv("REDIS_POSITION_KEY", "position:current"),
+            order_guard_prefix=os.getenv("REDIS_ORDER_GUARD_PREFIX", "orders:guard"),
+            order_record_prefix=os.getenv("REDIS_ORDER_RECORD_PREFIX", "orders:record"),
         )
 
 
@@ -89,6 +93,15 @@ class StorageGateway:
             "Connected to Firestore",
             extra={"event": "firestore_connected", "doc_path": self.settings.firestore_config_doc},
         )
+
+    async def healthcheck(self) -> None:
+        redis_client = self._require_redis()
+        await redis_client.ping()
+
+        if self._config_doc_ref is None:
+            raise RuntimeError("Firestore config document reference is not initialized.")
+
+        await asyncio.to_thread(self._config_doc_ref.get)
 
     async def publish_event(
         self,
@@ -180,6 +193,84 @@ class StorageGateway:
         redis_client = self._require_redis()
         return await redis_client.hgetall(self.settings.redis_config_key)
 
+    async def acquire_order_guard(
+        self,
+        *,
+        guard_key: str,
+        order_id: str,
+        ttl_seconds: int,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        redis_client = self._require_redis()
+        lock_key = f"{self.settings.order_guard_prefix}:{guard_key}"
+
+        lock_payload: dict[str, Any] = {
+            "order_id": order_id,
+            "guard_key": guard_key,
+            "created_at": _now_iso(),
+        }
+        if payload:
+            lock_payload["payload"] = payload
+
+        acquired = await redis_client.set(
+            lock_key,
+            json.dumps(lock_payload, ensure_ascii=False, separators=(",", ":"), default=str),
+            ex=max(1, ttl_seconds),
+            nx=True,
+        )
+        return bool(acquired)
+
+    async def get_order_guard(self, *, guard_key: str) -> dict[str, Any] | None:
+        redis_client = self._require_redis()
+        lock_key = f"{self.settings.order_guard_prefix}:{guard_key}"
+        raw = await redis_client.get(lock_key)
+        if raw is None:
+            return None
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = {"raw": raw}
+
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+
+    async def release_order_guard(self, *, guard_key: str) -> None:
+        redis_client = self._require_redis()
+        lock_key = f"{self.settings.order_guard_prefix}:{guard_key}"
+        await redis_client.delete(lock_key)
+
+    async def record_order_state(
+        self,
+        *,
+        order_id: str,
+        status: str,
+        ttl_seconds: int,
+        payload: dict[str, Any] | None = None,
+        guard_key: str | None = None,
+    ) -> None:
+        redis_client = self._require_redis()
+        record_key = f"{self.settings.order_record_prefix}:{order_id}"
+
+        mapping: dict[str, str] = {
+            "order_id": order_id,
+            "status": status,
+            "updated_at": _now_iso(),
+        }
+        if guard_key:
+            mapping["guard_key"] = guard_key
+        if payload is not None:
+            mapping["payload"] = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+
+        await redis_client.hset(record_key, mapping=mapping)
+        await redis_client.expire(record_key, max(60, ttl_seconds))
+
     async def record_price(self, *, pair: str, price: float, raw: dict[str, Any]) -> None:
         redis_client = self._require_redis()
         redis_key = f"{self.settings.price_prefix}:{pair}"
@@ -201,20 +292,22 @@ class StorageGateway:
         required_spread_bps: float,
         total_fee_bps: float,
         profitable: bool,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         redis_client = self._require_redis()
         redis_key = f"{self.settings.spread_prefix}:{pair}"
-        await redis_client.hset(
-            redis_key,
-            mapping={
-                "pair": pair,
-                "spread_bps": f"{spread_bps:.6f}",
-                "required_spread_bps": f"{required_spread_bps:.6f}",
-                "total_fee_bps": f"{total_fee_bps:.6f}",
-                "profitable": "1" if profitable else "0",
-                "updated_at": _now_iso(),
-            },
-        )
+        mapping: dict[str, str] = {
+            "pair": pair,
+            "spread_bps": f"{spread_bps:.6f}",
+            "required_spread_bps": f"{required_spread_bps:.6f}",
+            "total_fee_bps": f"{total_fee_bps:.6f}",
+            "profitable": "1" if profitable else "0",
+            "updated_at": _now_iso(),
+        }
+        if extra:
+            mapping.update({str(key): _serialize_for_redis(value) for key, value in extra.items()})
+
+        await redis_client.hset(redis_key, mapping=mapping)
 
     async def record_position(self, mapping: dict[str, Any]) -> None:
         redis_client = self._require_redis()
@@ -239,6 +332,9 @@ class StorageGateway:
             else:
                 await self._redis.close()
             self._redis = None
+
+        self._config_doc_ref = None
+        self._firestore = None
 
     def _require_redis(self) -> Redis:
         if self._redis is None:
