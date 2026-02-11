@@ -33,6 +33,9 @@ class TraderEngine:
         await self.watcher.healthcheck()
         await self.executor.healthcheck()
 
+    async def resolve_priority_fee(self, *, runtime_config: RuntimeConfig) -> PriorityFeePlan:
+        return await self.executor.resolve_priority_fee(runtime_config=runtime_config)
+
     @staticmethod
     def build_idempotency_key(*, pair: PairConfig, observation: SpreadObservation) -> str:
         return build_idempotency_key(pair=pair, observation=observation)
