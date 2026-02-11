@@ -1,0 +1,53 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_CONFIG_KEY: ${REDIS_CONFIG_KEY:-config}
+      REDIS_HEARTBEAT_KEY: ${REDIS_HEARTBEAT_KEY:-bot:heartbeat}
+      REDIS_PRICE_PREFIX: ${REDIS_PRICE_PREFIX:-prices}
+      REDIS_SPREAD_PREFIX: ${REDIS_SPREAD_PREFIX:-spreads}
+      REDIS_POSITION_KEY: ${REDIS_POSITION_KEY:-position:current}
+      FIRESTORE_PROJECT_ID: ${FIRESTORE_PROJECT_ID:-}
+      FIRESTORE_CONFIG_DOC: ${FIRESTORE_CONFIG_DOC:-bots/solana-bot/config}
+      BOT_EVENTS_COLLECTION: ${BOT_EVENTS_COLLECTION:-bot_events}
+      FIREBASE_CREDENTIALS: ${FIREBASE_CREDENTIALS:-}
+      RPC_URL: ${RPC_URL:-https://api.mainnet-beta.solana.com}
+      PRIVATE_KEY: ${PRIVATE_KEY:-}
+      DRY_RUN: ${DRY_RUN:-true}
+      JUPITER_QUOTE_API: ${JUPITER_QUOTE_API:-https://quote-api.jup.ag/v6}
+      WATCH_INTERVAL_SECONDS: ${WATCH_INTERVAL_SECONDS:-1.0}
+      ERROR_BACKOFF_SECONDS: ${ERROR_BACKOFF_SECONDS:-2.0}
+      MIN_SPREAD_BPS: ${MIN_SPREAD_BPS:-5}
+      DEX_FEE_BPS: ${DEX_FEE_BPS:-4}
+      PRIORITY_FEE_MICRO_LAMPORTS: ${PRIORITY_FEE_MICRO_LAMPORTS:-10000}
+      PRIORITY_COMPUTE_UNITS: ${PRIORITY_COMPUTE_UNITS:-200000}
+      TRADE_ENABLED: ${TRADE_ENABLED:-false}
+      PAIR_SYMBOL: ${PAIR_SYMBOL:-SOL/USDC}
+      PAIR_BASE_MINT: ${PAIR_BASE_MINT:-So11111111111111111111111111111111111111112}
+      PAIR_QUOTE_MINT: ${PAIR_QUOTE_MINT:-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v}
+      PAIR_BASE_DECIMALS: ${PAIR_BASE_DECIMALS:-9}
+      PAIR_QUOTE_DECIMALS: ${PAIR_QUOTE_DECIMALS:-6}
+      PAIR_BASE_AMOUNT: ${PAIR_BASE_AMOUNT:-1000000000}
+      PAIR_SLIPPAGE_BPS: ${PAIR_SLIPPAGE_BPS:-20}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 20s
+    volumes:
+      - .:/app
+
+  redis:
+    image: redis:alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped

@@ -1,0 +1,7 @@
+aiohttp>=3.9.5,<4.0.0
+google-cloud-firestore>=2.16.0,<3.0.0
+jupiter-python-sdk>=0.0.2,<1.0.0
+python-dotenv>=1.0.1,<2.0.0
+redis>=5.0.1,<6.0.0
+solana>=0.35.1,<1.0.0
+solders>=0.23.0,<1.0.0
