@@ -66,6 +66,13 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def to_float(value: Any, default: float | None = None) -> float | None:
     if value is None or value == "":
         return default
@@ -140,6 +147,48 @@ def resolve_credentials_path(raw_path: str, repo_root: Path) -> str:
     return path
 
 
+def safe_rate(value: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    return value / total
+
+
+def convert_base_to_quote(
+    *,
+    amount_base: float,
+    base_price_usd: float,
+    usd_jpy: float,
+) -> tuple[float | None, float | None]:
+    if base_price_usd <= 0:
+        return None, None
+
+    usd = amount_base * base_price_usd
+    if usd_jpy <= 0:
+        return usd, None
+    return usd, usd * usd_jpy
+
+
+def format_float(value: float | None, digits: int = 6) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.{digits}f}"
+
+
+def status_is_filled(status: str) -> bool:
+    normalized = status.strip().lower()
+    return normalized in {"filled", "confirmed"}
+
+
+def status_is_failed(status: str) -> bool:
+    normalized = status.strip().lower()
+    return normalized == "failed"
+
+
+def status_is_skipped(status: str) -> bool:
+    normalized = status.strip().lower()
+    return normalized.startswith("skipped")
+
+
 @dataclass(slots=True)
 class TradeRow:
     trade_id: str
@@ -148,11 +197,18 @@ class TradeRow:
     pair: str
     status: str
     reason: str
+    execution_mode: str
+    atomic_mode: str
+    send_mode_requested: str
+    plan_id: str
     spread_bps: float | None
     total_fee_bps: float | None
     required_spread_bps: float | None
+    threshold_excess_bps: float | None
+    expected_net_bps: float | None
     priority_fee_micro_lamports: int | None
     amount_in_raw: int
+    pnl_delta_raw: float | None
     net_bps: float | None
     est_pnl_raw: float | None
     est_pnl_base: float | None
@@ -167,8 +223,18 @@ class AggregateSummary:
     pair: str
     run_id: str
     statuses: list[str]
+    mode_filter: str
     status_counts: dict[str, int]
     reason_counts_top10: list[tuple[str, int]]
+    execution_mode_counts: dict[str, int]
+    atomic_mode_counts: dict[str, int]
+    send_mode_counts: dict[str, int]
+    plan_count: int
+    dry_run_count: int
+    live_count: int
+    filled_count: int
+    failed_count: int
+    skipped_count: int
     spread_bps_avg: float
     total_fee_bps_avg: float
     net_bps_avg: float
@@ -176,18 +242,44 @@ class AggregateSummary:
     net_bps_p50: float
     net_bps_p90: float
     net_positive_rate: float
+    threshold_excess_bps_avg: float
+    threshold_excess_bps_p10: float
+    threshold_excess_bps_p50: float
+    threshold_excess_bps_p90: float
+    threshold_excess_positive_rate: float
+    expected_net_bps_avg: float
+    expected_net_bps_p10: float
+    expected_net_bps_p50: float
+    expected_net_bps_p90: float
+    expected_net_positive_rate: float
     estimated_pnl_raw_total: float
     estimated_pnl_base_total: float
+    realized_pnl_raw_total: float
+    realized_pnl_base_total: float
+    realized_positive_rate: float
 
 
 def parse_args() -> argparse.Namespace:
     bot_collection = (os.getenv("BOT_COLLECTION", "bots").strip("/") or "bots")
-    bot_id = (os.getenv("BOT_ID", "solana-bot").strip() or "solana-bot").replace("/", "-")
+    base_bot_id = (os.getenv("BOT_ID", "solana-bot").strip() or "solana-bot").replace("/", "-")
+    dry_run = env_bool("DRY_RUN", True)
+    split_dry_run_results = env_bool("FIRESTORE_SPLIT_DRY_RUN_RESULTS", True)
+    dry_run_suffix = (os.getenv("FIRESTORE_DRY_RUN_RESULTS_SUFFIX", "-dryrun") or "-dryrun").strip()
+    if not dry_run_suffix:
+        dry_run_suffix = "-dryrun"
+    explicit_results_bot_id = (os.getenv("FIRESTORE_RESULTS_BOT_ID", "").strip() or "").replace("/", "-")
+
+    if explicit_results_bot_id:
+        default_bot_id = explicit_results_bot_id
+    elif dry_run and split_dry_run_results:
+        default_bot_id = f"{base_bot_id}{dry_run_suffix}"
+    else:
+        default_bot_id = base_bot_id
 
     parser = argparse.ArgumentParser(
         description=(
-            "Aggregate Firestore trades and compute dry-run quality metrics "
-            "(net_bps / estimated pnl)."
+            "Aggregate Firestore trades and compute practical metrics for dry-run/live operations "
+            "(status mix, threshold edge, expected/realized pnl)."
         )
     )
     parser.add_argument(
@@ -201,7 +293,7 @@ def parse_args() -> argparse.Namespace:
         help="Service account json path. Defaults to FIREBASE_CREDENTIALS.",
     )
     parser.add_argument("--bot-collection", default=bot_collection)
-    parser.add_argument("--bot-id", default=bot_id)
+    parser.add_argument("--bot-id", default=default_bot_id)
     parser.add_argument(
         "--trades-collection",
         default=os.getenv("BOT_TRADES_COLLECTION", "trades"),
@@ -222,6 +314,12 @@ def parse_args() -> argparse.Namespace:
         dest="statuses",
         default=[],
         help="Filter by status. Repeat to include multiple values.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["all", "dry_run", "live"],
+        default=(os.getenv("ANALYZE_MODE", "all") or "all").strip().lower(),
+        help="Scope rows by execution mode: all, dry_run only, or live (non-dry_run).",
     )
     parser.add_argument(
         "--since-hours",
@@ -245,13 +343,30 @@ def parse_args() -> argparse.Namespace:
         "--base-decimals",
         type=int,
         default=env_int("PAIR_BASE_DECIMALS", 9),
-        help="Decimals for base token (for estimated_pnl_base display).",
+        help="Decimals for base token.",
+    )
+    parser.add_argument(
+        "--base-symbol",
+        default=os.getenv("PAIR_BASE_SYMBOL", "SOL"),
+        help="Base token symbol used in display (for example SOL).",
+    )
+    parser.add_argument(
+        "--sol-price-usd",
+        type=float,
+        default=env_float("SOL_PRICE_USD", 0.0),
+        help="Optional conversion rate. If >0, prints USD and JPY estimates.",
+    )
+    parser.add_argument(
+        "--usd-jpy",
+        type=float,
+        default=env_float("USD_JPY", env_float("USDJPY", 0.0)),
+        help="Optional USDJPY rate for JPY conversion.",
     )
     parser.add_argument(
         "--target-net-bps",
         type=float,
         default=1.0,
-        help="Target edge used for min_spread recommendation.",
+        help="Target gross edge used for min_spread recommendation.",
     )
     parser.add_argument(
         "--csv",
@@ -284,25 +399,66 @@ def parse_trade_row(
     base_amount_default: int,
     base_decimals: int,
 ) -> TradeRow:
+    metadata_raw = payload.get("metadata")
+    metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+
     spread_bps = to_float(payload.get("spread_bps"))
+    if spread_bps is None:
+        spread_bps = to_float(metadata.get("observed_spread_bps"))
+    if spread_bps is None:
+        spread_bps = to_float(metadata.get("spread_bps"))
+
     total_fee_bps = to_float(payload.get("total_fee_bps"))
+    if total_fee_bps is None:
+        total_fee_bps = to_float(metadata.get("expected_fee_bps"))
+
     required_spread_bps = to_float(payload.get("required_spread_bps"))
+    if required_spread_bps is None:
+        required_spread_bps = to_float(metadata.get("required_spread_bps"))
+
+    threshold_excess_bps: float | None = None
+    if spread_bps is not None and required_spread_bps is not None:
+        threshold_excess_bps = spread_bps - required_spread_bps
+
+    expected_net_bps = to_float(metadata.get("expected_net_bps"))
+    if expected_net_bps is None:
+        expected_net_bps = threshold_excess_bps
+
     net_bps: float | None = None
     if spread_bps is not None and total_fee_bps is not None:
         net_bps = spread_bps - total_fee_bps
 
-    metadata = payload.get("metadata")
     amount_in_raw = to_int(payload.get("amount_in"), None)
-    if amount_in_raw is None and isinstance(metadata, dict):
+    if amount_in_raw is None:
         amount_in_raw = to_int(metadata.get("amount_in"), None)
     if amount_in_raw is None:
+        amount_in_raw = to_int(metadata.get("base_amount"), None)
+    if amount_in_raw is None:
         amount_in_raw = base_amount_default
+
+    priority_fee_micro_lamports = to_int(payload.get("priority_fee_micro_lamports"), None)
+    if priority_fee_micro_lamports is None:
+        priority_fee_plan = metadata.get("priority_fee_plan")
+        if isinstance(priority_fee_plan, dict):
+            priority_fee_micro_lamports = to_int(priority_fee_plan.get("selected_micro_lamports"), None)
 
     est_pnl_raw: float | None = None
     est_pnl_base: float | None = None
     if net_bps is not None:
         est_pnl_raw = amount_in_raw * net_bps / 10_000
         est_pnl_base = est_pnl_raw / (10**base_decimals)
+
+    execution_mode = str(payload.get("execution_mode") or metadata.get("execution_mode") or "").strip().lower()
+    if not execution_mode:
+        execution_mode = "unknown"
+
+    atomic_mode = str(metadata.get("mode") or "").strip().lower()
+    if not atomic_mode:
+        atomic_mode = str(metadata.get("atomic_send_mode") or "").strip().lower()
+
+    send_mode_requested = str(metadata.get("send_mode_requested") or "").strip().lower()
+    if not send_mode_requested:
+        send_mode_requested = str(metadata.get("atomic_send_mode") or "").strip().lower()
 
     return TradeRow(
         trade_id=trade_id,
@@ -311,11 +467,18 @@ def parse_trade_row(
         pair=str(payload.get("pair") or ""),
         status=str(payload.get("status") or ""),
         reason=str(payload.get("reason") or ""),
+        execution_mode=execution_mode,
+        atomic_mode=atomic_mode,
+        send_mode_requested=send_mode_requested,
+        plan_id=str(metadata.get("plan_id") or "").strip(),
         spread_bps=spread_bps,
         total_fee_bps=total_fee_bps,
         required_spread_bps=required_spread_bps,
-        priority_fee_micro_lamports=to_int(payload.get("priority_fee_micro_lamports"), None),
+        threshold_excess_bps=threshold_excess_bps,
+        expected_net_bps=expected_net_bps,
+        priority_fee_micro_lamports=priority_fee_micro_lamports,
         amount_in_raw=amount_in_raw,
+        pnl_delta_raw=to_float(payload.get("pnl_delta")),
         net_bps=net_bps,
         est_pnl_raw=est_pnl_raw,
         est_pnl_base=est_pnl_base,
@@ -331,18 +494,49 @@ def build_summary(
     pair: str,
     run_id: str,
     statuses: list[str],
+    mode_filter: str,
+    base_decimals: int,
 ) -> AggregateSummary:
-    status_counts = Counter(row.status for row in rows)
+    status_counts = Counter((row.status or "unknown") for row in rows)
     reason_counts = Counter(row.reason for row in rows if row.reason)
+
+    execution_mode_counts = Counter((row.execution_mode or "unknown") for row in rows)
+    atomic_mode_counts = Counter(
+        (row.atomic_mode or "unspecified")
+        for row in rows
+        if row.execution_mode == "atomic"
+    )
+    send_mode_counts = Counter(
+        (row.send_mode_requested or "unspecified")
+        for row in rows
+        if row.execution_mode == "atomic"
+    )
 
     spreads = [row.spread_bps for row in rows if row.spread_bps is not None]
     fees = [row.total_fee_bps for row in rows if row.total_fee_bps is not None]
     nets = [row.net_bps for row in rows if row.net_bps is not None]
+    threshold_excesses = [row.threshold_excess_bps for row in rows if row.threshold_excess_bps is not None]
+    expected_nets = [row.expected_net_bps for row in rows if row.expected_net_bps is not None]
+
     pnl_raw_values = [row.est_pnl_raw for row in rows if row.est_pnl_raw is not None]
     pnl_base_values = [row.est_pnl_base for row in rows if row.est_pnl_base is not None]
+    realized_raw_values = [row.pnl_delta_raw for row in rows if row.pnl_delta_raw is not None]
 
     net_positive = sum(1 for value in nets if value > 0)
-    net_positive_rate = (net_positive / len(nets)) if nets else 0.0
+    threshold_positive = sum(1 for value in threshold_excesses if value > 0)
+    expected_positive = sum(1 for value in expected_nets if value > 0)
+    realized_positive = sum(1 for value in realized_raw_values if value > 0)
+
+    dry_run_count = status_counts.get("dry_run", 0)
+    filled_count = sum(1 for row in rows if status_is_filled(row.status))
+    failed_count = sum(1 for row in rows if status_is_failed(row.status))
+    skipped_count = sum(1 for row in rows if status_is_skipped(row.status))
+    live_count = max(0, len(rows) - dry_run_count)
+
+    plan_ids = {row.plan_id for row in rows if row.plan_id}
+
+    realized_pnl_raw_total = sum(realized_raw_values)
+    realized_pnl_base_total = realized_pnl_raw_total / (10**base_decimals)
 
     return AggregateSummary(
         scanned_docs=scanned_docs,
@@ -352,17 +546,40 @@ def build_summary(
         pair=pair,
         run_id=run_id,
         statuses=statuses,
+        mode_filter=mode_filter,
         status_counts=dict(status_counts),
         reason_counts_top10=reason_counts.most_common(10),
+        execution_mode_counts=dict(execution_mode_counts),
+        atomic_mode_counts=dict(atomic_mode_counts),
+        send_mode_counts=dict(send_mode_counts),
+        plan_count=len(plan_ids),
+        dry_run_count=dry_run_count,
+        live_count=live_count,
+        filled_count=filled_count,
+        failed_count=failed_count,
+        skipped_count=skipped_count,
         spread_bps_avg=(sum(spreads) / len(spreads)) if spreads else 0.0,
         total_fee_bps_avg=(sum(fees) / len(fees)) if fees else 0.0,
         net_bps_avg=(sum(nets) / len(nets)) if nets else 0.0,
         net_bps_p10=percentile(nets, 0.10),
         net_bps_p50=percentile(nets, 0.50),
         net_bps_p90=percentile(nets, 0.90),
-        net_positive_rate=net_positive_rate,
+        net_positive_rate=safe_rate(net_positive, len(nets)),
+        threshold_excess_bps_avg=(sum(threshold_excesses) / len(threshold_excesses)) if threshold_excesses else 0.0,
+        threshold_excess_bps_p10=percentile(threshold_excesses, 0.10),
+        threshold_excess_bps_p50=percentile(threshold_excesses, 0.50),
+        threshold_excess_bps_p90=percentile(threshold_excesses, 0.90),
+        threshold_excess_positive_rate=safe_rate(threshold_positive, len(threshold_excesses)),
+        expected_net_bps_avg=(sum(expected_nets) / len(expected_nets)) if expected_nets else 0.0,
+        expected_net_bps_p10=percentile(expected_nets, 0.10),
+        expected_net_bps_p50=percentile(expected_nets, 0.50),
+        expected_net_bps_p90=percentile(expected_nets, 0.90),
+        expected_net_positive_rate=safe_rate(expected_positive, len(expected_nets)),
         estimated_pnl_raw_total=sum(pnl_raw_values),
         estimated_pnl_base_total=sum(pnl_base_values),
+        realized_pnl_raw_total=realized_pnl_raw_total,
+        realized_pnl_base_total=realized_pnl_base_total,
+        realized_positive_rate=safe_rate(realized_positive, len(realized_raw_values)),
     )
 
 
@@ -378,18 +595,23 @@ def build_recommendations(summary: AggregateSummary, *, target_net_bps: float) -
     if summary.matched_docs < 30:
         suggestions.append("Samples are small (<30). Increase lookback window before final tuning.")
 
+    if summary.live_count == 0:
+        suggestions.append("All matched rows are dry_run. realized_pnl_* is expected to remain 0 in simulation mode.")
+    elif summary.filled_count == 0:
+        suggestions.append("Live rows exist but there are no filled trades. Check status/reason breakdown and guard thresholds.")
+
     if summary.net_bps_avg <= 0 or summary.net_positive_rate < 0.5:
         suggestions.append(
             (
-                "Quality is weak. Increase min_spread_bps. "
-                f"Current={current_min_spread:.3f}, suggested start={max(current_min_spread + 1.0, suggested_min_spread):.3f}"
+                "Gross edge quality is weak. Increase min_spread_bps or reduce fee components. "
+                f"Current={current_min_spread:.3f}, suggested_start={max(current_min_spread + 0.5, suggested_min_spread):.3f}"
             )
         )
-    elif summary.net_positive_rate >= 0.7 and summary.net_bps_p10 > 0:
+    elif summary.net_positive_rate >= 0.75 and summary.net_bps_p10 > 0:
         suggestions.append(
             (
-                "Quality is strong. You can test lowering min_spread_bps slightly for volume. "
-                f"Current={current_min_spread:.3f}, trial={max(0.1, current_min_spread - 0.5):.3f}"
+                "Gross edge quality is stable. You can test a small min_spread_bps reduction for more fills. "
+                f"Current={current_min_spread:.3f}, trial={max(0.1, current_min_spread - 0.2):.3f}"
             )
         )
     else:
@@ -401,11 +623,24 @@ def build_recommendations(summary: AggregateSummary, *, target_net_bps: float) -
             )
         )
 
-    if summary.net_bps_p10 < -2.0:
-        suggestions.append("Tail risk is high (p10 net_bps < -2). Reduce PAIR_BASE_AMOUNT or raise min_spread_bps.")
+    if summary.expected_net_bps_p10 < 0:
+        suggestions.append(
+            "Atomic re-quote edge has negative tail (expected_net_bps p10 < 0). "
+            "Raise ATOMIC_MARGIN_BPS or tighten staleness/latency controls."
+        )
 
-    if summary.matched_docs > 0 and summary.status_counts.get("dry_run", 0) == summary.matched_docs:
-        suggestions.append("All rows are dry_run. Before production, implement real swap path in LiveOrderExecutor.")
+    if summary.failed_count > 0:
+        suggestions.append("Execution failures detected. Inspect reason_counts_top10 and RPC/Jito reliability before scaling size.")
+
+    if summary.live_count > 0 and summary.realized_pnl_raw_total < 0:
+        suggestions.append(
+            "Realized pnl is negative in this window. Reduce size and/or raise min_spread until realized pnl stabilizes."
+        )
+
+    if summary.live_count > 0 and summary.skipped_count > summary.filled_count:
+        suggestions.append(
+            "Skipped trades dominate filled trades. Rebalance max_fee, tip cap, and spread threshold to improve execution rate."
+        )
 
     return suggestions
 
@@ -422,11 +657,18 @@ def write_csv(path: Path, rows: list[TradeRow]) -> None:
                 "pair",
                 "status",
                 "reason",
+                "execution_mode",
+                "atomic_mode",
+                "send_mode_requested",
+                "plan_id",
                 "spread_bps",
                 "total_fee_bps",
                 "required_spread_bps",
+                "threshold_excess_bps",
+                "expected_net_bps",
                 "priority_fee_micro_lamports",
                 "amount_in_raw",
+                "pnl_delta_raw",
                 "net_bps",
                 "est_pnl_raw",
                 "est_pnl_base",
@@ -500,6 +742,10 @@ def main() -> None:
     pair_filter = args.pair.strip()
     run_filter = args.run_id.strip()
 
+    mode_filter = (args.mode or "all").strip().lower()
+    if mode_filter not in {"all", "dry_run", "live"}:
+        mode_filter = "all"
+
     for snapshot in snapshots:
         scanned_docs += 1
         payload = snapshot.to_dict() or {}
@@ -510,7 +756,13 @@ def main() -> None:
             continue
         if run_filter and str(payload.get("run_id") or "") != run_filter:
             continue
+
         status = str(payload.get("status") or "")
+        if mode_filter == "dry_run" and status != "dry_run":
+            continue
+        if mode_filter == "live" and status == "dry_run":
+            continue
+
         if status_filter and status not in status_filter:
             continue
 
@@ -540,19 +792,43 @@ def main() -> None:
         pair=pair_filter,
         run_id=run_filter,
         statuses=sorted(status_filter),
+        mode_filter=mode_filter,
+        base_decimals=max(0, int(args.base_decimals)),
     )
     recommendations = build_recommendations(summary, target_net_bps=args.target_net_bps)
 
     if args.csv:
         write_csv((repo_root / args.csv).resolve(), rows)
 
+    estimated_usd_total, estimated_jpy_total = convert_base_to_quote(
+        amount_base=summary.estimated_pnl_base_total,
+        base_price_usd=max(0.0, float(args.sol_price_usd)),
+        usd_jpy=max(0.0, float(args.usd_jpy)),
+    )
+    realized_usd_total, realized_jpy_total = convert_base_to_quote(
+        amount_base=summary.realized_pnl_base_total,
+        base_price_usd=max(0.0, float(args.sol_price_usd)),
+        usd_jpy=max(0.0, float(args.usd_jpy)),
+    )
+
     if args.json:
         output = {
             "summary": asdict(summary),
+            "fx": {
+                "base_symbol": str(args.base_symbol),
+                "base_price_usd": float(args.sol_price_usd),
+                "usd_jpy": float(args.usd_jpy),
+                "estimated_pnl_usd_total": estimated_usd_total,
+                "estimated_pnl_jpy_total": estimated_jpy_total,
+                "realized_pnl_usd_total": realized_usd_total,
+                "realized_pnl_jpy_total": realized_jpy_total,
+            },
             "recommendations": recommendations,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return
+
+    base_symbol = str(args.base_symbol or "BASE")
 
     print(f"[info] project_id={project_id}")
     print(f"[info] query_mode={query_mode}")
@@ -560,21 +836,68 @@ def main() -> None:
     print(f"[info] window_start_utc={summary.window_start_utc}")
     print(f"[info] window_end_utc={summary.window_end_utc}")
     print(f"[info] pair_filter={summary.pair or '(all)'} run_filter={summary.run_id or '(all)'}")
+    print(f"[info] mode_filter={summary.mode_filter}")
     print(f"[info] status_filter={summary.statuses or ['(all)']}")
     print("")
     print("[summary]")
     print(
         f"  spread_bps_avg={summary.spread_bps_avg:.4f} total_fee_bps_avg={summary.total_fee_bps_avg:.4f} "
-        f"net_bps_avg={summary.net_bps_avg:.4f}"
+        f"gross_net_bps_avg={summary.net_bps_avg:.4f}"
     )
     print(
-        f"  net_bps_p10={summary.net_bps_p10:.4f} p50={summary.net_bps_p50:.4f} "
+        f"  gross_net_bps_p10={summary.net_bps_p10:.4f} p50={summary.net_bps_p50:.4f} "
         f"p90={summary.net_bps_p90:.4f} positive_rate={summary.net_positive_rate:.2%}"
     )
     print(
-        f"  estimated_pnl_raw_total={summary.estimated_pnl_raw_total:.6f} "
-        f"estimated_pnl_base_total={summary.estimated_pnl_base_total:.10f}"
+        f"  threshold_excess_bps_avg={summary.threshold_excess_bps_avg:.4f} "
+        f"p10={summary.threshold_excess_bps_p10:.4f} p50={summary.threshold_excess_bps_p50:.4f} "
+        f"p90={summary.threshold_excess_bps_p90:.4f} positive_rate={summary.threshold_excess_positive_rate:.2%}"
     )
+    print(
+        f"  expected_net_bps_avg={summary.expected_net_bps_avg:.4f} "
+        f"p10={summary.expected_net_bps_p10:.4f} p50={summary.expected_net_bps_p50:.4f} "
+        f"p90={summary.expected_net_bps_p90:.4f} positive_rate={summary.expected_net_positive_rate:.2%}"
+    )
+    print(
+        f"  estimated_pnl_raw_total={summary.estimated_pnl_raw_total:.6f} "
+        f"estimated_pnl_{base_symbol}_total={summary.estimated_pnl_base_total:.10f}"
+    )
+    if estimated_usd_total is not None:
+        print(
+            f"  estimated_pnl_usd_total={format_float(estimated_usd_total, 4)} "
+            f"estimated_pnl_jpy_total={format_float(estimated_jpy_total, 2)}"
+        )
+    print(
+        f"  realized_pnl_raw_total={summary.realized_pnl_raw_total:.6f} "
+        f"realized_pnl_{base_symbol}_total={summary.realized_pnl_base_total:.10f} "
+        f"realized_positive_rate={summary.realized_positive_rate:.2%}"
+    )
+    if realized_usd_total is not None:
+        print(
+            f"  realized_pnl_usd_total={format_float(realized_usd_total, 4)} "
+            f"realized_pnl_jpy_total={format_float(realized_jpy_total, 2)}"
+        )
+    print("")
+    print("[execution]")
+    print(
+        f"  dry_run={summary.dry_run_count} live={summary.live_count} filled={summary.filled_count} "
+        f"failed={summary.failed_count} skipped={summary.skipped_count} plan_count={summary.plan_count}"
+    )
+    print("")
+    print("[execution_mode_counts]")
+    for key, value in sorted(summary.execution_mode_counts.items(), key=lambda item: item[0]):
+        print(f"  {key}: {value}")
+    if summary.atomic_mode_counts:
+        print("")
+        print("[atomic_mode_counts]")
+        for key, value in sorted(summary.atomic_mode_counts.items(), key=lambda item: item[0]):
+            print(f"  {key}: {value}")
+    if summary.send_mode_counts:
+        print("")
+        print("[send_mode_counts]")
+        for key, value in sorted(summary.send_mode_counts.items(), key=lambda item: item[0]):
+            print(f"  {key}: {value}")
+
     print("")
     print("[status_counts]")
     for key, value in sorted(summary.status_counts.items(), key=lambda item: item[0]):
@@ -587,6 +910,8 @@ def main() -> None:
     print("[recommendations]")
     for recommendation in recommendations:
         print(f"  - {recommendation}")
+    if args.sol_price_usd <= 0:
+        print("  - Set --sol-price-usd (and optionally --usd-jpy) to view USD/JPY pnl estimates.")
     if args.csv:
         print("")
         print(f"[info] csv={str((repo_root / args.csv).resolve())}")

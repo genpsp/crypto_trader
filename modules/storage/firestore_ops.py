@@ -94,7 +94,7 @@ class FirestoreStorageOps:
             "level": level,
             "event": event,
             "message": message,
-            "bot_id": self.settings.bot_id,
+            "bot_id": self.settings.firestore_results_bot_id,
             "run_id": self.settings.bot_run_id,
             "env": self.settings.bot_env,
             "schema_version": self.settings.config_schema_version,
@@ -194,7 +194,7 @@ class FirestoreStorageOps:
 
         payload.setdefault("order_id", order_id_raw or resolved_trade_id)
         payload["trade_id"] = resolved_trade_id
-        payload["bot_id"] = self.settings.bot_id
+        payload["bot_id"] = self.settings.firestore_results_bot_id
         payload["run_id"] = self.settings.bot_run_id
         payload["env"] = self.settings.bot_env
         payload["schema_version"] = self.settings.config_schema_version
@@ -356,7 +356,7 @@ class FirestoreStorageOps:
             "trade_count": firestore.Increment(int(batch["trade_count"])),
             "successful_trade_count": firestore.Increment(int(batch["successful_trade_count"])),
             "pnl_total": firestore.Increment(float(batch["pnl_total"])),
-            "bot_id": self.settings.bot_id,
+            "bot_id": self.settings.firestore_results_bot_id,
             "env": self.settings.bot_env,
             "schema_version": self.settings.config_schema_version,
             "run_id": self.settings.bot_run_id,
@@ -376,7 +376,7 @@ class FirestoreStorageOps:
                     int(day_payload.get("successful_trade_count", 0))
                 ),
                 "pnl_total": firestore.Increment(float(day_payload.get("pnl_total", 0.0))),
-                "bot_id": self.settings.bot_id,
+                "bot_id": self.settings.firestore_results_bot_id,
                 "env": self.settings.bot_env,
                 "schema_version": self.settings.config_schema_version,
                 "day_id": day_id,
@@ -391,7 +391,7 @@ class FirestoreStorageOps:
             raise RuntimeError("Firestore namespace references are not initialized.")
 
         bot_payload: dict[str, Any] = {
-            "bot_id": self.settings.bot_id,
+            "bot_id": self.settings.firestore_results_bot_id,
             "env": self.settings.bot_env,
             "schema_version": self.settings.config_schema_version,
             "config_doc": self._resolved_firestore_config_doc,
@@ -400,7 +400,7 @@ class FirestoreStorageOps:
 
         run_payload: dict[str, Any] = {
             "run_id": self.settings.bot_run_id,
-            "bot_id": self.settings.bot_id,
+            "bot_id": self.settings.firestore_results_bot_id,
             "env": self.settings.bot_env,
             "status": "running",
             "pid": os.getpid(),
@@ -416,7 +416,7 @@ class FirestoreStorageOps:
     def _initialize_namespace_refs(self) -> None:
         firestore_client = self._require_firestore()
 
-        bot_doc_path = f"{self.settings.bot_collection}/{self.settings.bot_id}"
+        bot_doc_path = f"{self.settings.bot_collection}/{self.settings.firestore_results_bot_id}"
         self._bot_doc_ref = firestore_client.document(bot_doc_path)
         self._run_doc_ref = self._bot_doc_ref.collection(self.settings.bot_runs_collection).document(
             self.settings.bot_run_id

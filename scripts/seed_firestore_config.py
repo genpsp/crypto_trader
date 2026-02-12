@@ -9,6 +9,7 @@ from typing import Any
 
 try:
     from dotenv import load_dotenv
+
     DOTENV_AVAILABLE = True
 except ModuleNotFoundError:
     DOTENV_AVAILABLE = False
@@ -19,15 +20,23 @@ except ModuleNotFoundError:
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": 1,
-    "min_spread_bps": 6.5,
-    "dex_fee_bps": 4.0,
-    "priority_fee_micro_lamports": 12_000,
+    "min_spread_bps": 2.2,
+    "dex_fee_bps": 0.0,
+    "priority_fee_micro_lamports": 6_000,
     "priority_compute_units": 200_000,
-    "priority_fee_percentile": 0.8,
-    "priority_fee_multiplier": 1.2,
-    "max_fee_micro_lamports": 90_000,
+    "priority_fee_percentile": 0.6,
+    "priority_fee_multiplier": 1.1,
+    "max_fee_micro_lamports": 30_000,
     "trade_enabled": False,
     "order_guard_ttl_seconds": 20,
+    "execution_mode": "atomic",
+    "atomic_send_mode": "bundle",
+    "atomic_expiry_ms": 5_000,
+    "atomic_margin_bps": 3.0,
+    "atomic_bundle_min_expected_net_bps": 2.0,
+    "jito_block_engine_url": "",
+    "jito_tip_lamports_max": 20_000,
+    "jito_tip_lamports_recommended": 5_000,
 }
 
 
@@ -63,6 +72,23 @@ def env_int(name: str, default: int) -> int:
         return int(float(raw.strip()))
     except ValueError:
         return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,12 +136,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=max(1, env_int("CONFIG_SCHEMA_VERSION", DEFAULT_CONFIG["schema_version"])),
     )
-    parser.add_argument("--min-spread-bps", type=float, default=DEFAULT_CONFIG["min_spread_bps"])
-    parser.add_argument("--dex-fee-bps", type=float, default=DEFAULT_CONFIG["dex_fee_bps"])
+    parser.add_argument(
+        "--min-spread-bps",
+        type=float,
+        default=env_float("MIN_SPREAD_BPS", DEFAULT_CONFIG["min_spread_bps"]),
+    )
+    parser.add_argument(
+        "--dex-fee-bps",
+        type=float,
+        default=env_float("DEX_FEE_BPS", DEFAULT_CONFIG["dex_fee_bps"]),
+    )
     parser.add_argument(
         "--priority-fee-micro-lamports",
         type=int,
-        default=DEFAULT_CONFIG["priority_fee_micro_lamports"],
+        default=env_int(
+            "PRIORITY_FEE_MICRO_LAMPORTS",
+            DEFAULT_CONFIG["priority_fee_micro_lamports"],
+        ),
     )
     parser.add_argument(
         "--priority-compute-units",
@@ -125,27 +162,74 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--priority-fee-percentile",
         type=float,
-        default=DEFAULT_CONFIG["priority_fee_percentile"],
+        default=env_float("PRIORITY_FEE_PERCENTILE", DEFAULT_CONFIG["priority_fee_percentile"]),
     )
     parser.add_argument(
         "--priority-fee-multiplier",
         type=float,
-        default=DEFAULT_CONFIG["priority_fee_multiplier"],
+        default=env_float("PRIORITY_FEE_MULTIPLIER", DEFAULT_CONFIG["priority_fee_multiplier"]),
     )
     parser.add_argument(
         "--max-fee-micro-lamports",
         type=int,
-        default=DEFAULT_CONFIG["max_fee_micro_lamports"],
+        default=env_int("MAX_FEE_MICRO_LAMPORTS", DEFAULT_CONFIG["max_fee_micro_lamports"]),
     )
     parser.add_argument(
         "--trade-enabled",
-        action="store_true",
-        help="Set trade_enabled=true. Omit to keep false by default.",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TRADE_ENABLED", DEFAULT_CONFIG["trade_enabled"]),
+        help="Set trade_enabled true/false. Defaults to TRADE_ENABLED env or false.",
     )
     parser.add_argument(
         "--order-guard-ttl-seconds",
         type=int,
-        default=DEFAULT_CONFIG["order_guard_ttl_seconds"],
+        default=max(1, env_int("ORDER_GUARD_TTL_SECONDS", DEFAULT_CONFIG["order_guard_ttl_seconds"])),
+    )
+
+    parser.add_argument(
+        "--execution-mode",
+        choices=["atomic", "legacy"],
+        default=os.getenv("EXECUTION_MODE", DEFAULT_CONFIG["execution_mode"]),
+    )
+    parser.add_argument(
+        "--atomic-send-mode",
+        choices=["single_tx", "bundle", "auto"],
+        default=os.getenv("ATOMIC_SEND_MODE", DEFAULT_CONFIG["atomic_send_mode"]),
+    )
+    parser.add_argument(
+        "--atomic-expiry-ms",
+        type=int,
+        default=env_int("ATOMIC_EXPIRY_MS", DEFAULT_CONFIG["atomic_expiry_ms"]),
+    )
+    parser.add_argument(
+        "--atomic-margin-bps",
+        type=float,
+        default=env_float("ATOMIC_MARGIN_BPS", DEFAULT_CONFIG["atomic_margin_bps"]),
+    )
+    parser.add_argument(
+        "--atomic-bundle-min-expected-net-bps",
+        type=float,
+        default=env_float(
+            "ATOMIC_BUNDLE_MIN_EXPECTED_NET_BPS",
+            DEFAULT_CONFIG["atomic_bundle_min_expected_net_bps"],
+        ),
+    )
+    parser.add_argument(
+        "--jito-block-engine-url",
+        default=os.getenv("JITO_BLOCK_ENGINE_URL", DEFAULT_CONFIG["jito_block_engine_url"]),
+    )
+    parser.add_argument(
+        "--jito-tip-lamports-max",
+        type=int,
+        default=env_int("JITO_TIP_LAMPORTS_MAX", DEFAULT_CONFIG["jito_tip_lamports_max"]),
+    )
+    parser.add_argument(
+        "--jito-tip-lamports-recommended",
+        type=int,
+        default=env_int(
+            "JITO_TIP_LAMPORTS_RECOMMENDED",
+            DEFAULT_CONFIG["jito_tip_lamports_recommended"],
+        ),
     )
 
     return parser.parse_args()
@@ -188,6 +272,14 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "max_fee_micro_lamports": int(args.max_fee_micro_lamports),
         "trade_enabled": bool(args.trade_enabled),
         "order_guard_ttl_seconds": int(args.order_guard_ttl_seconds),
+        "execution_mode": str(args.execution_mode),
+        "atomic_send_mode": str(args.atomic_send_mode),
+        "atomic_expiry_ms": max(250, int(args.atomic_expiry_ms)),
+        "atomic_margin_bps": max(0.0, float(args.atomic_margin_bps)),
+        "atomic_bundle_min_expected_net_bps": max(0.0, float(args.atomic_bundle_min_expected_net_bps)),
+        "jito_block_engine_url": str(args.jito_block_engine_url).strip(),
+        "jito_tip_lamports_max": max(0, int(args.jito_tip_lamports_max)),
+        "jito_tip_lamports_recommended": max(0, int(args.jito_tip_lamports_recommended)),
     }
 
 

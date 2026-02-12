@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from collections import deque
 from typing import Any
 
@@ -11,6 +12,7 @@ from modules.trading import (
     DryRunOrderExecutor,
     HeliusQuoteWatcher,
     HeliusRateLimitError,
+    LiveAtomicArbExecutor,
     LiveOrderExecutor,
     PairConfig,
     RuntimeConfig,
@@ -29,6 +31,12 @@ def to_float(value: Any, default: float) -> float:
         return default
 
 
+def drawdown_pct_from_peak(*, current_lamports: int, peak_lamports: int) -> float:
+    if peak_lamports <= 0:
+        return 0.0
+    return max(0.0, ((peak_lamports - current_lamports) / peak_lamports) * 100.0)
+
+
 async def wait_with_stop(stop_event: asyncio.Event, timeout_seconds: float) -> None:
     if timeout_seconds <= 0:
         return
@@ -44,9 +52,10 @@ def estimate_execution_fee_lamports(
     priority_fee_micro_lamports: int,
     priority_compute_units: int,
     base_fee_lamports: int,
+    tip_lamports: int = 0,
 ) -> int:
     priority_fee_lamports = int((priority_fee_micro_lamports * priority_compute_units) / 1_000_000)
-    return max(0, priority_fee_lamports) + max(0, base_fee_lamports)
+    return max(0, priority_fee_lamports) + max(0, base_fee_lamports) + max(0, tip_lamports)
 
 
 async def bootstrap_dependencies(
@@ -56,7 +65,7 @@ async def bootstrap_dependencies(
     app_settings: AppSettings,
     storage: StorageGateway,
     watcher: HeliusQuoteWatcher,
-    executor: DryRunOrderExecutor | LiveOrderExecutor,
+    executor: DryRunOrderExecutor | LiveOrderExecutor | LiveAtomicArbExecutor,
     config_listener_loop: asyncio.AbstractEventLoop,
     on_config_update: ConfigUpdateHandler,
 ) -> None:
@@ -162,8 +171,11 @@ async def run_trading_loop(
     recent_pnl_total = 0.0
     last_execution_at = 0.0
     consecutive_execution_errors = 0
+    execution_rate_limited_count = 0
     execution_circuit_open_until = 0.0
     drawdown_circuit_open_until = 0.0
+    peak_wallet_balance_lamports: int | None = None
+    final_stop_active = False
 
     async def open_execution_circuit(*, reason: str, error: str = "") -> None:
         nonlocal execution_circuit_open_until, consecutive_execution_errors
@@ -225,15 +237,24 @@ async def run_trading_loop(
         recent_pnl_deltas.append((now_time, pnl_delta_lamports))
         recent_pnl_total += pnl_delta_lamports
 
+    def compute_rate_limit_backoff_seconds(*, rate_limited_count: int) -> float:
+        if rate_limited_count <= 0:
+            return 0.0
+        base_seconds = min(30.0, float(2 ** max(0, rate_limited_count - 1)))
+        jitter_seconds = random.uniform(0.0, max(0.1, base_seconds * 0.25))
+        return min(30.0, base_seconds + jitter_seconds)
+
     async def open_drawdown_circuit(
         *,
         reason: str,
         current_drawdown_lamports: float,
+        current_drawdown_pct: float | None = None,
     ) -> None:
         nonlocal drawdown_circuit_open_until
 
         cooldown_seconds = app_settings.live_drawdown_circuit_breaker_seconds
         drawdown_circuit_open_until = loop.time() + cooldown_seconds
+        max_drawdown_pct = app_settings.live_max_drawdown_pct
         log_event(
             logger,
             level="warning",
@@ -243,6 +264,8 @@ async def run_trading_loop(
             cooldown_seconds=cooldown_seconds,
             current_drawdown_lamports=round(current_drawdown_lamports, 4),
             max_drawdown_lamports=round(app_settings.live_max_drawdown_lamports, 4),
+            current_drawdown_pct=round(current_drawdown_pct, 4) if current_drawdown_pct is not None else None,
+            max_drawdown_pct=round(max_drawdown_pct, 4) if max_drawdown_pct > 0 else None,
         )
         await guarded_call(
             lambda: storage.record_position(
@@ -251,6 +274,9 @@ async def run_trading_loop(
                     "status": "drawdown_circuit_open",
                     "reason": reason,
                     "current_drawdown_lamports": round(current_drawdown_lamports, 4),
+                    "current_drawdown_pct": (
+                        round(current_drawdown_pct, 4) if current_drawdown_pct is not None else None
+                    ),
                 }
             ),
             logger=logger,
@@ -267,6 +293,10 @@ async def run_trading_loop(
                     "reason": reason,
                     "current_drawdown_lamports": round(current_drawdown_lamports, 4),
                     "max_drawdown_lamports": round(app_settings.live_max_drawdown_lamports, 4),
+                    "current_drawdown_pct": (
+                        round(current_drawdown_pct, 4) if current_drawdown_pct is not None else None
+                    ),
+                    "max_drawdown_pct": round(max_drawdown_pct, 4) if max_drawdown_pct > 0 else None,
                     "cooldown_seconds": cooldown_seconds,
                 },
             ),
@@ -274,6 +304,131 @@ async def run_trading_loop(
             event="drawdown_circuit_publish_failed",
             message="Failed to publish drawdown circuit breaker event",
         )
+
+    async def enforce_equity_guards(
+        *,
+        observation_forward_price: float,
+        now_time: float,
+    ) -> bool:
+        nonlocal peak_wallet_balance_lamports, final_stop_active
+
+        if app_settings.dry_run:
+            return False
+
+        if final_stop_active:
+            return True
+
+        needs_balance_check = (
+            app_settings.live_max_drawdown_pct > 0
+            or app_settings.live_final_stop_equity_usd > 0
+        )
+        if not needs_balance_check:
+            return False
+
+        balance_reader = getattr(trader_engine.executor, "get_wallet_balance_lamports", None)
+        if not callable(balance_reader):
+            return False
+
+        wallet_balance_raw = await guarded_call(
+            balance_reader,
+            logger=logger,
+            event="wallet_balance_fetch_failed",
+            message="Failed to fetch wallet balance for equity guard checks",
+            level="warning",
+            default=None,
+        )
+        if wallet_balance_raw is None:
+            return False
+
+        wallet_balance_lamports = int(to_float(wallet_balance_raw, -1))
+        if wallet_balance_lamports < 0:
+            return False
+
+        if peak_wallet_balance_lamports is None or wallet_balance_lamports > peak_wallet_balance_lamports:
+            peak_wallet_balance_lamports = wallet_balance_lamports
+
+        peak_balance = max(1, peak_wallet_balance_lamports or wallet_balance_lamports)
+        balance_drawdown_lamports = max(0, peak_balance - wallet_balance_lamports)
+        balance_drawdown_pct = drawdown_pct_from_peak(
+            current_lamports=wallet_balance_lamports,
+            peak_lamports=peak_balance,
+        )
+
+        if (
+            app_settings.live_max_drawdown_pct > 0
+            and balance_drawdown_pct >= app_settings.live_max_drawdown_pct
+        ):
+            if drawdown_circuit_open_until <= now_time:
+                await open_drawdown_circuit(
+                    reason="drawdown_pct_limit_exceeded",
+                    current_drawdown_lamports=float(balance_drawdown_lamports),
+                    current_drawdown_pct=balance_drawdown_pct,
+                )
+            return True
+
+        if app_settings.live_final_stop_equity_usd <= 0:
+            return False
+
+        if observation_forward_price <= 0:
+            log_event(
+                logger,
+                level="warning",
+                event="final_equity_stop_price_unavailable",
+                message="Final equity USD stop could not be evaluated because forward price was unavailable",
+            )
+            return False
+
+        wallet_balance_units = wallet_balance_lamports / (10**pair.base_decimals)
+        current_equity_usd = wallet_balance_units * observation_forward_price
+        if current_equity_usd > app_settings.live_final_stop_equity_usd:
+            return False
+
+        final_stop_active = True
+        log_event(
+            logger,
+            level="error",
+            event="final_equity_stop_triggered",
+            message="Final equity stop triggered; execution is now disabled until manual intervention",
+            current_equity_usd=round(current_equity_usd, 6),
+            final_stop_equity_usd=round(app_settings.live_final_stop_equity_usd, 6),
+            wallet_balance_lamports=wallet_balance_lamports,
+            peak_wallet_balance_lamports=peak_balance,
+            current_drawdown_pct=round(balance_drawdown_pct, 6),
+        )
+        await guarded_call(
+            lambda: storage.record_position(
+                {
+                    "pair": pair.symbol,
+                    "status": "final_stop_active",
+                    "reason": "equity_below_usd_threshold",
+                    "current_equity_usd": round(current_equity_usd, 6),
+                    "final_stop_equity_usd": round(app_settings.live_final_stop_equity_usd, 6),
+                    "wallet_balance_lamports": wallet_balance_lamports,
+                }
+            ),
+            logger=logger,
+            event="final_equity_stop_position_record_failed",
+            message="Failed to record final equity stop state",
+        )
+        await guarded_call(
+            lambda: storage.publish_event(
+                level="ERROR",
+                event="final_equity_stop_triggered",
+                message="Final equity stop triggered and execution has been disabled",
+                details={
+                    "pair": pair.symbol,
+                    "current_equity_usd": round(current_equity_usd, 6),
+                    "final_stop_equity_usd": round(app_settings.live_final_stop_equity_usd, 6),
+                    "wallet_balance_lamports": wallet_balance_lamports,
+                    "peak_wallet_balance_lamports": peak_balance,
+                    "current_drawdown_pct": round(balance_drawdown_pct, 6),
+                },
+            ),
+            logger=logger,
+            event="final_equity_stop_publish_failed",
+            message="Failed to publish final equity stop event",
+        )
+        return True
 
     while not stop_event.is_set():
         transient_backoff_seconds = 0.0
@@ -356,12 +511,24 @@ async def run_trading_loop(
                     "priority_fee_recommended_micro_lamports": priority_fee_plan.recommended_micro_lamports,
                     "priority_fee_sample_size": priority_fee_plan.sample_size,
                     "blocked_by_fee_cap": decision.blocked_by_fee_cap,
+                    "tip_lamports": decision.tip_lamports,
+                    "atomic_margin_bps": decision.atomic_margin_bps,
+                    "expected_net_bps": decision.expected_net_bps,
+                    "execution_mode": runtime_config.execution_mode,
+                    "atomic_send_mode": runtime_config.atomic_send_mode,
                 },
             )
             await storage.update_heartbeat()
 
+            now_time = loop.time()
+            equity_guard_blocked = await enforce_equity_guards(
+                observation_forward_price=observation.forward_price,
+                now_time=now_time,
+            )
+            if equity_guard_blocked:
+                continue
+
             if decision.should_execute:
-                now_time = loop.time()
                 if not app_settings.dry_run and app_settings.live_max_drawdown_lamports > 0:
                     current_drawdown_lamports = refresh_recent_pnl(now_time)
                     if current_drawdown_lamports >= app_settings.live_max_drawdown_lamports:
@@ -424,11 +591,19 @@ async def run_trading_loop(
 
                 estimated_fee_lamports = 0
                 if not app_settings.dry_run:
-                    pending_records = await storage.list_order_records(
-                        statuses={"pending", "submitted", "pending_confirmation", "confirming"},
-                        limit=app_settings.live_max_pending_orders + 1,
-                    )
-                    pending_count = len(pending_records)
+                    if runtime_config.execution_mode == "atomic":
+                        pending_atomic_records = await storage.list_pending_atomic(
+                            statuses={"submitted", "pending_confirmation", "confirming"},
+                            limit=app_settings.live_max_pending_orders + 1,
+                        )
+                        pending_count = len(pending_atomic_records)
+                    else:
+                        pending_records = await storage.list_order_records(
+                            statuses={"pending", "submitted", "pending_confirmation", "confirming"},
+                            limit=app_settings.live_max_pending_orders + 1,
+                        )
+                        pending_count = len(pending_records)
+
                     if pending_count >= app_settings.live_max_pending_orders:
                         log_event(
                             logger,
@@ -437,13 +612,21 @@ async def run_trading_loop(
                             message="Execution skipped due to pending order guard",
                             pending_count=pending_count,
                             max_pending_orders=app_settings.live_max_pending_orders,
+                            execution_mode=runtime_config.execution_mode,
                         )
                         continue
+
+                    tip_lamports = 0
+                    if runtime_config.execution_mode == "atomic" and runtime_config.atomic_send_mode != "single_tx":
+                        recommended_tip = max(0, runtime_config.jito_tip_lamports_recommended)
+                        max_tip = max(0, runtime_config.jito_tip_lamports_max)
+                        tip_lamports = min(recommended_tip, max_tip) if max_tip > 0 else recommended_tip
 
                     estimated_fee_lamports = estimate_execution_fee_lamports(
                         priority_fee_micro_lamports=priority_fee_plan.selected_micro_lamports,
                         priority_compute_units=runtime_config.priority_compute_units,
                         base_fee_lamports=app_settings.live_estimated_base_fee_lamports,
+                        tip_lamports=tip_lamports,
                     )
 
                     fee_window_seconds = app_settings.live_fee_budget_window_seconds
@@ -464,6 +647,7 @@ async def run_trading_loop(
                             estimated_fee_lamports=estimated_fee_lamports,
                             current_window_fee_lamports=recent_execution_fee_total,
                             max_window_fee_lamports=max_fee_per_window,
+                            tip_lamports=tip_lamports,
                         )
                         continue
 
@@ -477,25 +661,6 @@ async def run_trading_loop(
                         idempotency_key=idempotency_key,
                     )
                 except Exception as error:
-                    if not app_settings.dry_run and estimated_fee_lamports > 0:
-                        execution_time = loop.time()
-                        recent_execution_timestamps.append(execution_time)
-                        last_execution_at = execution_time
-                        recent_execution_fees.append((execution_time, estimated_fee_lamports))
-                        recent_execution_fee_total += estimated_fee_lamports
-                        record_realized_pnl(
-                            now_time=execution_time,
-                            pnl_delta_lamports=-float(estimated_fee_lamports),
-                        )
-                        current_drawdown_lamports = refresh_recent_pnl(execution_time)
-                        if (
-                            app_settings.live_max_drawdown_lamports > 0
-                            and current_drawdown_lamports >= app_settings.live_max_drawdown_lamports
-                        ):
-                            await open_drawdown_circuit(
-                                reason="execution_exception_fee_loss",
-                                current_drawdown_lamports=current_drawdown_lamports,
-                            )
                     consecutive_execution_errors += 1
                     log_event(
                         logger,
@@ -516,6 +681,38 @@ async def run_trading_loop(
                         )
                     continue
 
+                if result.status == "rate_limited":
+                    execution_rate_limited_count += 1
+                    retry_after_seconds = to_float(result.metadata.get("retry_after_seconds"), 0.0)
+                    adaptive_backoff_seconds = compute_rate_limit_backoff_seconds(
+                        rate_limited_count=execution_rate_limited_count
+                    )
+                    transient_backoff_seconds = max(
+                        transient_backoff_seconds,
+                        retry_after_seconds,
+                        adaptive_backoff_seconds,
+                    )
+                    log_event(
+                        logger,
+                        level="warning",
+                        event="execution_rate_limited",
+                        message="Execution skipped due to Jito rate limiting",
+                        rate_limited_count=execution_rate_limited_count,
+                        consecutive_errors=consecutive_execution_errors,
+                        retry_after_seconds=retry_after_seconds if retry_after_seconds > 0 else None,
+                        adaptive_backoff_seconds=round(adaptive_backoff_seconds, 3),
+                        applied_backoff_seconds=round(transient_backoff_seconds, 3),
+                        reason=result.reason,
+                    )
+                    await guarded_call(
+                        storage.update_heartbeat,
+                        logger=logger,
+                        event="execution_rate_limited_heartbeat_failed",
+                        message="Failed to update heartbeat during execution rate-limit backoff",
+                    )
+                else:
+                    execution_rate_limited_count = 0
+
                 if result.status == "failed":
                     consecutive_execution_errors += 1
                     if (
@@ -529,11 +726,12 @@ async def run_trading_loop(
                 else:
                     consecutive_execution_errors = 0
 
+                is_non_execution_result = result.status.startswith("skipped_") or result.status == "rate_limited"
                 realized_pnl_lamports = to_float(result.metadata.get("pnl_delta"), 0.0)
                 if (
                     not app_settings.dry_run
                     and realized_pnl_lamports == 0.0
-                    and result.status not in {"skipped_duplicate", "skipped_max_fee", "skipped_low_balance"}
+                    and not is_non_execution_result
                     and estimated_fee_lamports > 0
                 ):
                     realized_pnl_lamports = -float(estimated_fee_lamports)
@@ -579,7 +777,7 @@ async def run_trading_loop(
                         },
                         event_id=f"order_execution:{result.order_id}",
                     )
-                if result.status not in {"skipped_duplicate", "skipped_max_fee", "skipped_low_balance"}:
+                if not is_non_execution_result:
                     execution_time = loop.time()
                     recent_execution_timestamps.append(execution_time)
                     last_execution_at = execution_time

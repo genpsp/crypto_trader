@@ -18,6 +18,10 @@ class RedisStorageOps:
     def _order_lock_key(prefix: str, guard_key: str) -> str:
         return f"{prefix}:{guard_key}"
 
+    @staticmethod
+    def _pending_atomic_key(prefix: str, plan_id: str) -> str:
+        return f"{prefix}:{plan_id}"
+
     async def sync_config_to_redis(self, config: dict[str, Any], *, source: str) -> None:
         redis_client = self._require_redis()
 
@@ -191,6 +195,187 @@ class RedisStorageOps:
 
         records.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
         return records
+
+    async def save_pending_atomic(
+        self,
+        *,
+        plan_id: str,
+        status: str,
+        order_id: str,
+        guard_key: str,
+        tx_signatures: list[str],
+        ttl_seconds: int,
+        mode: str,
+        bundle_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        redis_client = self._require_redis()
+        record_key = self._pending_atomic_key(self.settings.pending_atomic_prefix, plan_id)
+        now = _now_iso()
+
+        mapping: dict[str, str] = {
+            "plan_id": plan_id,
+            "status": status,
+            "order_id": order_id,
+            "guard_key": guard_key,
+            "mode": mode,
+            "created_at": now,
+            "updated_at": now,
+            "tx_signatures": json.dumps(tx_signatures, ensure_ascii=False, separators=(",", ":")),
+        }
+        if bundle_id:
+            mapping["bundle_id"] = bundle_id
+        if payload is not None:
+            mapping["payload"] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+        await redis_client.hset(record_key, mapping=mapping)
+        await redis_client.expire(record_key, max(60, ttl_seconds))
+
+    async def update_pending_atomic(
+        self,
+        *,
+        plan_id: str,
+        status: str,
+        ttl_seconds: int,
+        tx_signatures: list[str] | None = None,
+        bundle_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        redis_client = self._require_redis()
+        record_key = self._pending_atomic_key(self.settings.pending_atomic_prefix, plan_id)
+        existing = await redis_client.hgetall(record_key)
+
+        mapping: dict[str, str] = {
+            "plan_id": plan_id,
+            "status": status,
+            "updated_at": _now_iso(),
+        }
+        if tx_signatures is not None:
+            mapping["tx_signatures"] = json.dumps(
+                tx_signatures,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        if bundle_id is not None:
+            mapping["bundle_id"] = bundle_id
+
+        if payload is not None:
+            merged_payload: dict[str, Any] = {}
+            raw_existing_payload = existing.get("payload")
+            if raw_existing_payload:
+                with contextlib.suppress(Exception):
+                    existing_payload = json.loads(raw_existing_payload)
+                    if isinstance(existing_payload, dict):
+                        merged_payload = dict(existing_payload)
+            merged_payload.update(payload)
+            mapping["payload"] = json.dumps(
+                merged_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+
+        await redis_client.hset(record_key, mapping=mapping)
+        await redis_client.expire(record_key, max(60, ttl_seconds))
+
+    async def get_pending_atomic(self, *, plan_id: str) -> dict[str, Any] | None:
+        redis_client = self._require_redis()
+        record_key = self._pending_atomic_key(self.settings.pending_atomic_prefix, plan_id)
+        payload = await redis_client.hgetall(record_key)
+        if not payload:
+            return None
+
+        tx_signatures: list[str] = []
+        raw_signatures = payload.get("tx_signatures")
+        if raw_signatures:
+            with contextlib.suppress(Exception):
+                parsed = json.loads(raw_signatures)
+                if isinstance(parsed, list):
+                    tx_signatures = [str(item) for item in parsed]
+
+        parsed_payload: dict[str, Any] = {}
+        raw_payload = payload.get("payload")
+        if raw_payload:
+            with contextlib.suppress(Exception):
+                candidate = json.loads(raw_payload)
+                if isinstance(candidate, dict):
+                    parsed_payload = candidate
+
+        return {
+            "plan_id": str(payload.get("plan_id", "")),
+            "status": str(payload.get("status", "")),
+            "order_id": str(payload.get("order_id", "")),
+            "guard_key": str(payload.get("guard_key", "")),
+            "mode": str(payload.get("mode", "")),
+            "bundle_id": str(payload.get("bundle_id", "")) or None,
+            "created_at": str(payload.get("created_at", "")),
+            "updated_at": str(payload.get("updated_at", "")),
+            "tx_signatures": tx_signatures,
+            "payload": parsed_payload,
+        }
+
+    async def list_pending_atomic(
+        self,
+        *,
+        statuses: set[str] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        redis_client = self._require_redis()
+        normalized_limit = max(1, limit)
+        normalized_statuses = {status for status in (statuses or set()) if status}
+        pattern = f"{self.settings.pending_atomic_prefix}:*"
+
+        records: list[dict[str, Any]] = []
+        async for key in redis_client.scan_iter(match=pattern, count=min(1000, normalized_limit * 4)):
+            payload = await redis_client.hgetall(key)
+            if not payload:
+                continue
+
+            status = str(payload.get("status", ""))
+            if normalized_statuses and status not in normalized_statuses:
+                continue
+
+            tx_signatures: list[str] = []
+            raw_signatures = payload.get("tx_signatures")
+            if raw_signatures:
+                with contextlib.suppress(Exception):
+                    parsed_signatures = json.loads(raw_signatures)
+                    if isinstance(parsed_signatures, list):
+                        tx_signatures = [str(item) for item in parsed_signatures]
+
+            parsed_payload: dict[str, Any] = {}
+            raw_payload = payload.get("payload")
+            if raw_payload:
+                with contextlib.suppress(Exception):
+                    candidate = json.loads(raw_payload)
+                    if isinstance(candidate, dict):
+                        parsed_payload = candidate
+
+            records.append(
+                {
+                    "plan_id": str(payload.get("plan_id", "")) or key.split(":")[-1],
+                    "status": status,
+                    "order_id": str(payload.get("order_id", "")),
+                    "guard_key": str(payload.get("guard_key", "")),
+                    "mode": str(payload.get("mode", "")),
+                    "bundle_id": str(payload.get("bundle_id", "")) or None,
+                    "created_at": str(payload.get("created_at", "")),
+                    "updated_at": str(payload.get("updated_at", "")),
+                    "tx_signatures": tx_signatures,
+                    "payload": parsed_payload,
+                }
+            )
+            if len(records) >= normalized_limit:
+                break
+
+        records.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+        return records
+
+    async def delete_pending_atomic(self, *, plan_id: str) -> bool:
+        redis_client = self._require_redis()
+        record_key = self._pending_atomic_key(self.settings.pending_atomic_prefix, plan_id)
+        deleted = await redis_client.delete(record_key)
+        return bool(deleted)
 
     async def record_price(self, *, pair: str, price: float, raw: dict[str, Any]) -> None:
         redis_client = self._require_redis()

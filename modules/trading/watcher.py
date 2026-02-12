@@ -71,15 +71,17 @@ def _is_method_not_found_error(message: str) -> bool:
     return "method not found" in message.lower()
 
 
-def _build_helius_proxy_swap_quote_path(path: str) -> str | None:
+def _canonical_helius_jup_proxy_quote_path(path: str) -> str | None:
     normalized_path = (path or "/").rstrip("/")
-    if normalized_path.endswith("/jup-proxy"):
-        return f"{normalized_path}/swap/v1/quote"
-    if normalized_path.endswith("/jup-proxy/quote"):
-        return f"{normalized_path[:-len('/quote')]}/swap/v1/quote"
-    if normalized_path.endswith("/jup-proxy/swap/v1/quote"):
-        return normalized_path
-    return None
+    if not normalized_path:
+        return None
+
+    marker = "/jup-proxy"
+    index = normalized_path.find(marker)
+    if index < 0:
+        return None
+    prefix = normalized_path[: index + len(marker)]
+    return f"{prefix}/quote"
 
 
 def _append_unique(endpoints: list[str], endpoint: str) -> None:
@@ -87,25 +89,26 @@ def _append_unique(endpoints: list[str], endpoint: str) -> None:
         endpoints.append(endpoint)
 
 
-def _build_quote_endpoints(api_base_url: str) -> list[str]:
+def _build_quote_endpoints(api_base_url: str, *, enable_helius_jup_proxy: bool) -> list[str]:
     parsed = urlsplit(api_base_url)
     endpoints: list[str] = []
 
     if _is_helius_rpc_netloc(parsed.netloc):
         # Helius provides Jupiter proxy under /v0/jup-proxy/.
         if _is_helius_jup_proxy_path(parsed.path):
-            normalized_path = (parsed.path or "/").rstrip("/")
-            quote_path = normalized_path if normalized_path.endswith("/quote") else f"{normalized_path}/quote"
-            _append_unique(
-                endpoints,
-                urlunsplit((parsed.scheme, parsed.netloc, quote_path, parsed.query, parsed.fragment)),
-            )
-            fallback_path = _build_helius_proxy_swap_quote_path(parsed.path)
-            if fallback_path:
+            if enable_helius_jup_proxy:
+                canonical_path = _canonical_helius_jup_proxy_quote_path(parsed.path)
+                if canonical_path:
+                    _append_unique(
+                        endpoints,
+                        urlunsplit((parsed.scheme, parsed.netloc, canonical_path, parsed.query, parsed.fragment)),
+                    )
                 _append_unique(
                     endpoints,
-                    urlunsplit((parsed.scheme, parsed.netloc, fallback_path, parsed.query, parsed.fragment)),
+                    DEFAULT_JUPITER_QUOTE_ENDPOINT,
                 )
+                return endpoints
+
             _append_unique(endpoints, DEFAULT_JUPITER_QUOTE_ENDPOINT)
             return endpoints
 
@@ -168,6 +171,7 @@ class HeliusQuoteWatcher:
         api_base_url: str,
         api_key: str | None = None,
         jupiter_api_key: str | None = None,
+        enable_helius_jup_proxy: bool = False,
         timeout_seconds: float = 8.0,
         max_retries: int = 2,
         retry_backoff_seconds: float = 0.25,
@@ -176,7 +180,15 @@ class HeliusQuoteWatcher:
     ) -> None:
         self._logger = logger
         self._api_base_url = api_base_url.rstrip("/")
-        self._quote_endpoints = _build_quote_endpoints(api_base_url)
+        self._enable_helius_jup_proxy = enable_helius_jup_proxy
+        parsed_base_url = urlsplit(api_base_url)
+        self._configured_helius_jup_proxy = _is_helius_rpc_netloc(parsed_base_url.netloc) and _is_helius_jup_proxy_path(
+            parsed_base_url.path
+        )
+        self._quote_endpoints = _build_quote_endpoints(
+            api_base_url,
+            enable_helius_jup_proxy=enable_helius_jup_proxy,
+        )
         self._quote_endpoint_index = 0
         self._quote_endpoint = self._quote_endpoints[self._quote_endpoint_index]
         self._helius_probe_endpoint = _build_helius_probe_endpoint(api_base_url)
@@ -333,6 +345,22 @@ class HeliusQuoteWatcher:
 
         if (
             not self._fallback_quote_logged
+            and self._configured_helius_jup_proxy
+            and not self._enable_helius_jup_proxy
+        ):
+            self._fallback_quote_logged = True
+            log_event(
+                self._logger,
+                level="warning",
+                event="helius_jup_proxy_disabled",
+                message=(
+                    "Helius jup-proxy endpoint is disabled by configuration; quote requests start with Jupiter API."
+                ),
+                configured_url=self._api_base_url,
+                quote_endpoint=self._quote_endpoint,
+            )
+        elif (
+            not self._fallback_quote_logged
             and _is_helius_rpc_netloc(urlsplit(self._api_base_url).netloc)
             and not self._quote_endpoint_is_helius
         ):
@@ -349,8 +377,11 @@ class HeliusQuoteWatcher:
             )
 
         if not self._connectivity_checked:
-            await self._probe_helius_connectivity()
-            self._connectivity_checked = True
+            if self._configured_helius_jup_proxy and not self._enable_helius_jup_proxy:
+                self._connectivity_checked = True
+            else:
+                await self._probe_helius_connectivity()
+                self._connectivity_checked = True
 
     def _switch_quote_endpoint(self, *, reason: str, event: str, body_preview: str = "") -> bool:
         next_index = self._quote_endpoint_index + 1

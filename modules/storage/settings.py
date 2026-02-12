@@ -34,6 +34,11 @@ def to_bool(value: Any, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _sanitize_bot_id(value: str, default: str) -> str:
+    normalized = (value.strip() or default).replace("/", "-")
+    return normalized or default
+
+
 @dataclass(slots=True)
 class StorageSettings:
     redis_url: str
@@ -43,6 +48,10 @@ class StorageSettings:
     firestore_config_leaf_doc_id: str
     bot_collection: str
     bot_id: str
+    firestore_results_bot_id: str
+    dry_run: bool
+    firestore_split_dry_run_results: bool
+    firestore_dry_run_results_suffix: str
     bot_env: str
     bot_run_id: str
     bot_runs_collection: str
@@ -61,12 +70,29 @@ class StorageSettings:
     position_key: str
     order_guard_prefix: str
     order_record_prefix: str
+    pending_atomic_prefix: str
 
     @classmethod
     def from_env(cls) -> "StorageSettings":
         bot_collection = (os.getenv("BOT_COLLECTION", "bots").strip("/") or "bots")
-        bot_id = (os.getenv("BOT_ID", "solana-bot").strip() or "solana-bot").replace("/", "-")
+        bot_id = _sanitize_bot_id(os.getenv("BOT_ID", "solana-bot"), "solana-bot")
         default_config_doc = f"{bot_collection}/{bot_id}/config/runtime"
+
+        dry_run = to_bool(os.getenv("DRY_RUN"), True)
+        split_dry_run_results = to_bool(os.getenv("FIRESTORE_SPLIT_DRY_RUN_RESULTS"), True)
+        dry_run_suffix = (os.getenv("FIRESTORE_DRY_RUN_RESULTS_SUFFIX", "-dryrun") or "-dryrun").strip()
+        if not dry_run_suffix:
+            dry_run_suffix = "-dryrun"
+
+        explicit_results_bot_id_raw = os.getenv("FIRESTORE_RESULTS_BOT_ID", "")
+        explicit_results_bot_id = _sanitize_bot_id(explicit_results_bot_id_raw, "")
+
+        if explicit_results_bot_id:
+            firestore_results_bot_id = explicit_results_bot_id
+        elif dry_run and split_dry_run_results:
+            firestore_results_bot_id = _sanitize_bot_id(f"{bot_id}{dry_run_suffix}", bot_id)
+        else:
+            firestore_results_bot_id = bot_id
 
         return cls(
             redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
@@ -76,6 +102,10 @@ class StorageSettings:
             firestore_config_leaf_doc_id=os.getenv("FIRESTORE_CONFIG_LEAF_DOC_ID", "runtime"),
             bot_collection=bot_collection,
             bot_id=bot_id,
+            firestore_results_bot_id=firestore_results_bot_id,
+            dry_run=dry_run,
+            firestore_split_dry_run_results=split_dry_run_results,
+            firestore_dry_run_results_suffix=dry_run_suffix,
             bot_env=os.getenv("BOT_ENV", "dev"),
             bot_run_id=os.getenv("BOT_RUN_ID")
             or datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ"),
@@ -104,4 +134,5 @@ class StorageSettings:
             position_key=os.getenv("REDIS_POSITION_KEY", "position:current"),
             order_guard_prefix=os.getenv("REDIS_ORDER_GUARD_PREFIX", "orders:guard"),
             order_record_prefix=os.getenv("REDIS_ORDER_RECORD_PREFIX", "orders:record"),
+            pending_atomic_prefix=os.getenv("REDIS_PENDING_ATOMIC_PREFIX", "pending_atomic"),
         )
