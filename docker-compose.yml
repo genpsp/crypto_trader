@@ -26,10 +26,12 @@ services:
       BOT_METRICS_COLLECTION: ${BOT_METRICS_COLLECTION:-metrics}
       BOT_METRICS_DOC_ID: ${BOT_METRICS_DOC_ID:-runtime}
       FIREBASE_CREDENTIALS: ${FIREBASE_CREDENTIALS:-}
-      RPC_URL: ${RPC_URL:-https://api.mainnet-beta.solana.com}
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY}
       PRIVATE_KEY: ${PRIVATE_KEY:-}
       DRY_RUN: ${DRY_RUN:-true}
-      JUPITER_QUOTE_API: ${JUPITER_QUOTE_API:-https://quote-api.jup.ag/v6}
+      HELIUS_QUOTE_API: ${HELIUS_QUOTE_API:-https://mainnet.helius-rpc.com/v0/jup-proxy/swap/v1/quote?api-key=YOUR_API_KEY}
+      HELIUS_API_KEY: ${HELIUS_API_KEY:-}
+      JUPITER_API_KEY: ${JUPITER_API_KEY:-}
       WATCH_INTERVAL_SECONDS: ${WATCH_INTERVAL_SECONDS:-1.0}
       ERROR_BACKOFF_SECONDS: ${ERROR_BACKOFF_SECONDS:-2.0}
       CONFIG_SCHEMA_VERSION: ${CONFIG_SCHEMA_VERSION:-1}

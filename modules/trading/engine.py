@@ -14,7 +14,7 @@ from .types import (
     build_idempotency_key,
     make_order_id,
 )
-from .watcher import JupiterWatcher
+from .watcher import HeliusQuoteWatcher
 
 
 class TraderEngine:
@@ -22,7 +22,7 @@ class TraderEngine:
         self,
         *,
         logger: logging.Logger,
-        watcher: JupiterWatcher,
+        watcher: HeliusQuoteWatcher,
         executor: OrderExecutor,
     ) -> None:
         self._logger = logger

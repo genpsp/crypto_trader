@@ -14,7 +14,7 @@ from modules.bot_runtime.settings import AppSettings
 from modules.storage import StorageGateway, StorageSettings
 from modules.trading import (
     DryRunOrderExecutor,
-    JupiterWatcher,
+    HeliusQuoteWatcher,
     LiveOrderExecutor,
     PairConfig,
     RuntimeConfig,
@@ -32,7 +32,12 @@ async def main() -> None:
     runtime_defaults = RuntimeConfig.from_env_defaults()
 
     storage = StorageGateway(storage_settings, logger)
-    watcher = JupiterWatcher(logger=logger, api_base_url=app_settings.jupiter_quote_api)
+    watcher = HeliusQuoteWatcher(
+        logger=logger,
+        api_base_url=app_settings.helius_quote_api,
+        api_key=app_settings.helius_api_key or None,
+        jupiter_api_key=app_settings.jupiter_api_key or None,
+    )
     if app_settings.dry_run:
         executor: DryRunOrderExecutor | LiveOrderExecutor = DryRunOrderExecutor(
             logger=logger,
@@ -41,7 +46,7 @@ async def main() -> None:
     else:
         executor = LiveOrderExecutor(
             logger=logger,
-            rpc_url=app_settings.rpc_url,
+            rpc_url=app_settings.solana_rpc_url,
             private_key=app_settings.private_key,
             order_store=storage,
         )

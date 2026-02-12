@@ -8,7 +8,8 @@ from modules.common import guarded_call, log_event
 from modules.storage import ConfigUpdateHandler, StorageGateway
 from modules.trading import (
     DryRunOrderExecutor,
-    JupiterWatcher,
+    HeliusQuoteWatcher,
+    HeliusRateLimitError,
     LiveOrderExecutor,
     PairConfig,
     RuntimeConfig,
@@ -43,7 +44,7 @@ async def bootstrap_dependencies(
     stop_event: asyncio.Event,
     app_settings: AppSettings,
     storage: StorageGateway,
-    watcher: JupiterWatcher,
+    watcher: HeliusQuoteWatcher,
     executor: DryRunOrderExecutor | LiveOrderExecutor,
     config_listener_loop: asyncio.AbstractEventLoop,
     on_config_update: ConfigUpdateHandler,
@@ -145,6 +146,8 @@ async def run_trading_loop(
     pause_reason = ""
 
     while not stop_event.is_set():
+        transient_backoff_seconds = 0.0
+
         try:
             if order_intake_paused:
                 recovered = await try_resume_order_intake(
@@ -302,6 +305,26 @@ async def run_trading_loop(
                     required_spread_bps=decision.required_spread_bps,
                 )
 
+        except HeliusRateLimitError as error:
+            transient_backoff_seconds = max(
+                app_settings.error_backoff_seconds,
+                error.retry_after_seconds or 0.0,
+            )
+            provider = getattr(error, "provider", "quote")
+            log_event(
+                logger,
+                level="warning",
+                event=f"{provider}_rate_limited",
+                message=f"{provider.capitalize()} quote rate-limited; keeping order intake active and backing off",
+                error=str(error),
+                backoff_seconds=transient_backoff_seconds,
+            )
+            await guarded_call(
+                storage.update_heartbeat,
+                logger=logger,
+                event="helius_rate_limited_heartbeat_failed",
+                message="Failed to update heartbeat during rate-limit backoff",
+            )
         except Exception as error:
             pause_reason = str(error)
             order_intake_paused = True
@@ -346,5 +369,7 @@ async def run_trading_loop(
             delay_seconds = max(0.0, next_tick - now)
             if order_intake_paused:
                 delay_seconds = max(delay_seconds, app_settings.error_backoff_seconds)
+            if transient_backoff_seconds > 0:
+                delay_seconds = max(delay_seconds, transient_backoff_seconds)
 
             await wait_with_stop(stop_event, delay_seconds)

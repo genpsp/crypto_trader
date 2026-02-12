@@ -26,6 +26,9 @@ def log_event(
     if level == "error":
         logger.error(message, extra=extra)
         return
+    if level == "critical":
+        logger.critical(message, extra=extra)
+        return
     if level == "exception":
         logger.exception(message, extra=extra)
         return

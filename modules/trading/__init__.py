@@ -1,11 +1,12 @@
 from .engine import TraderEngine
 from .executors import DryRunOrderExecutor, LiveOrderExecutor
+from .watcher import HeliusQuoteWatcher, HeliusRateLimitError
 from .types import PairConfig, RuntimeConfig
-from .watcher import JupiterWatcher
 
 __all__ = [
     "DryRunOrderExecutor",
-    "JupiterWatcher",
+    "HeliusQuoteWatcher",
+    "HeliusRateLimitError",
     "LiveOrderExecutor",
     "PairConfig",
     "RuntimeConfig",

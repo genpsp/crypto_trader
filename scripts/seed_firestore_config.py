@@ -22,6 +22,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_spread_bps": 6.5,
     "dex_fee_bps": 4.0,
     "priority_fee_micro_lamports": 12_000,
+    "priority_compute_units": 200_000,
     "priority_fee_percentile": 0.8,
     "priority_fee_multiplier": 1.2,
     "max_fee_micro_lamports": 90_000,
@@ -117,6 +118,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CONFIG["priority_fee_micro_lamports"],
     )
     parser.add_argument(
+        "--priority-compute-units",
+        type=int,
+        default=max(1, env_int("PRIORITY_COMPUTE_UNITS", DEFAULT_CONFIG["priority_compute_units"])),
+    )
+    parser.add_argument(
         "--priority-fee-percentile",
         type=float,
         default=DEFAULT_CONFIG["priority_fee_percentile"],
@@ -176,6 +182,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "min_spread_bps": float(args.min_spread_bps),
         "dex_fee_bps": float(args.dex_fee_bps),
         "priority_fee_micro_lamports": int(args.priority_fee_micro_lamports),
+        "priority_compute_units": max(1, int(args.priority_compute_units)),
         "priority_fee_percentile": float(args.priority_fee_percentile),
         "priority_fee_multiplier": float(args.priority_fee_multiplier),
         "max_fee_micro_lamports": int(args.max_fee_micro_lamports),

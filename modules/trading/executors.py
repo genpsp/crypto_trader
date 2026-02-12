@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib
 import json
 import logging
 from typing import Any
@@ -277,7 +276,7 @@ class LiveOrderExecutor:
 
     async def connect(self) -> None:
         if not self._rpc_url:
-            raise ValueError("RPC_URL is required when DRY_RUN is false.")
+            raise ValueError("SOLANA_RPC_URL is required when DRY_RUN is false.")
         if not self._private_key:
             raise ValueError("PRIVATE_KEY is required when DRY_RUN is false.")
 
@@ -403,10 +402,6 @@ class LiveOrderExecutor:
             )
 
             _ = set_compute_unit_price(priority_fee_micro_lamports)
-            jupiter_sdk_available = False
-            with contextlib.suppress(Exception):
-                importlib.import_module("jupiter_python_sdk")
-                jupiter_sdk_available = True
 
             log_event(
                 self._logger,
@@ -419,7 +414,6 @@ class LiveOrderExecutor:
             )
 
             result_metadata = metadata.copy() if metadata else {}
-            result_metadata["jupiter_sdk_available"] = jupiter_sdk_available
             result_metadata["latest_blockhash"] = latest_blockhash
 
             result = ExecutionResult(
