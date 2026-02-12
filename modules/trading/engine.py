@@ -131,6 +131,9 @@ class TraderEngine:
                 "spread_bps": observation.spread_bps,
                 "forward_out_amount": observation.forward_out_amount,
                 "reverse_out_amount": observation.reverse_out_amount,
+                "forward_quote": observation.forward_quote,
+                "reverse_quote": observation.reverse_quote,
+                "pair_slippage_bps": pair.slippage_bps,
                 "priority_fee_plan": priority_fee_plan.to_dict(),
             },
         )

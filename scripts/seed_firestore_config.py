@@ -68,7 +68,7 @@ def env_int(name: str, default: int) -> int:
 def parse_args() -> argparse.Namespace:
     bot_collection = (os.getenv("BOT_COLLECTION", "bots").strip("/") or "bots")
     bot_id = (os.getenv("BOT_ID", "solana-bot").strip() or "solana-bot").replace("/", "-")
-    default_config_doc = os.getenv("FIRESTORE_CONFIG_DOC") or f"{bot_collection}/{bot_id}/configs"
+    default_config_doc = os.getenv("FIRESTORE_CONFIG_DOC") or f"{bot_collection}/{bot_id}/config/runtime"
 
     parser = argparse.ArgumentParser(
         description="Seed initial runtime config to Firestore for the Solana bot.",

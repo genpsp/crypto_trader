@@ -258,6 +258,14 @@ class OrderGuardStore(Protocol):
     ) -> None:
         ...
 
+    async def list_order_records(
+        self,
+        *,
+        statuses: set[str] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        ...
+
 
 class OrderExecutor(Protocol):
     async def connect(self) -> None:

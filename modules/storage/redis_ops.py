@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from typing import Any
 
@@ -145,6 +146,51 @@ class RedisStorageOps:
 
         await redis_client.hset(record_key, mapping=mapping)
         await redis_client.expire(record_key, max(60, ttl_seconds))
+
+    async def list_order_records(
+        self,
+        *,
+        statuses: set[str] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        redis_client = self._require_redis()
+        normalized_limit = max(1, limit)
+        normalized_statuses = {status for status in (statuses or set()) if status}
+        pattern = f"{self.settings.order_record_prefix}:*"
+
+        records: list[dict[str, Any]] = []
+        async for key in redis_client.scan_iter(match=pattern, count=min(1000, normalized_limit * 4)):
+            payload = await redis_client.hgetall(key)
+            if not payload:
+                continue
+
+            status = str(payload.get("status", ""))
+            if normalized_statuses and status not in normalized_statuses:
+                continue
+
+            parsed_payload: dict[str, Any] = {}
+            raw_payload = payload.get("payload")
+            if raw_payload:
+                with contextlib.suppress(Exception):
+                    candidate = json.loads(raw_payload)
+                    if isinstance(candidate, dict):
+                        parsed_payload = candidate
+
+            order_id = str(payload.get("order_id", "")) or key.split(":")[-1]
+            records.append(
+                {
+                    "order_id": order_id,
+                    "status": status,
+                    "guard_key": str(payload.get("guard_key", "")),
+                    "updated_at": str(payload.get("updated_at", "")),
+                    "payload": parsed_payload,
+                }
+            )
+            if len(records) >= normalized_limit:
+                break
+
+        records.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+        return records
 
     async def record_price(self, *, pair: str, price: float, raw: dict[str, Any]) -> None:
         redis_client = self._require_redis()

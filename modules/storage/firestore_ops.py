@@ -223,47 +223,168 @@ class FirestoreStorageOps:
             return
 
         await guarded_call(
-            lambda: self._update_trade_aggregates(
+            lambda: self._queue_trade_aggregate(
                 trade_id=resolved_trade_id,
                 status=status,
                 pnl_delta=pnl_delta,
             ),
             logger=self._logger,
             event="trade_aggregate_update_failed",
-            message="Failed to update trade aggregates",
+            message="Failed to queue trade aggregates",
             level="error",
             trade_id=resolved_trade_id,
         )
 
-    async def _update_trade_aggregates(self, *, trade_id: str, status: str, pnl_delta: float) -> None:
+    async def _queue_trade_aggregate(self, *, trade_id: str, status: str, pnl_delta: float) -> None:
         if self._metrics_doc_ref is None or self._pnl_daily_collection_ref is None:
             return
 
-        success_increment = 1 if status not in {"failed", "skipped_duplicate", "skipped_max_fee"} else 0
-        base_payload: dict[str, Any] = {
+        success_increment = 1 if status in {"filled", "dry_run"} else 0
+        day_id = _utc_day_id()
+        should_flush = False
+
+        async with self._aggregate_lock:
+            self._aggregate_pending_count += 1
+            self._aggregate_pending_success_count += success_increment
+            self._aggregate_pending_pnl_total += float(pnl_delta)
+            self._aggregate_pending_last_trade_id = trade_id
+            self._aggregate_pending_last_status = status
+
+            day_bucket = self._aggregate_pending_by_day.setdefault(
+                day_id,
+                {"trade_count": 0.0, "successful_trade_count": 0.0, "pnl_total": 0.0},
+            )
+            day_bucket["trade_count"] += 1.0
+            day_bucket["successful_trade_count"] += float(success_increment)
+            day_bucket["pnl_total"] += float(pnl_delta)
+
+            elapsed_seconds = (
+                datetime.now(timezone.utc) - self._aggregate_last_flush_at
+            ).total_seconds()
+            if (
+                self._aggregate_pending_count >= self.settings.firestore_aggregate_batch_size
+                or elapsed_seconds >= self.settings.firestore_aggregate_flush_interval_seconds
+            ):
+                should_flush = True
+
+        if should_flush:
+            await self.flush_trade_aggregates(force=False)
+
+    async def flush_trade_aggregates(self, *, force: bool) -> None:
+        if self._metrics_doc_ref is None or self._pnl_daily_collection_ref is None:
+            return
+
+        batch: dict[str, Any] | None = None
+        now_utc = datetime.now(timezone.utc)
+        async with self._aggregate_lock:
+            if self._aggregate_pending_count <= 0:
+                return
+
+            elapsed_seconds = (now_utc - self._aggregate_last_flush_at).total_seconds()
+            if not force:
+                if self._aggregate_pending_count < self.settings.firestore_aggregate_batch_size:
+                    if elapsed_seconds < self.settings.firestore_aggregate_flush_interval_seconds:
+                        return
+
+            batch = {
+                "trade_count": int(self._aggregate_pending_count),
+                "successful_trade_count": int(self._aggregate_pending_success_count),
+                "pnl_total": float(self._aggregate_pending_pnl_total),
+                "last_trade_id": self._aggregate_pending_last_trade_id,
+                "last_status": self._aggregate_pending_last_status,
+                "by_day": {
+                    key: {
+                        "trade_count": int(value.get("trade_count", 0)),
+                        "successful_trade_count": int(value.get("successful_trade_count", 0)),
+                        "pnl_total": float(value.get("pnl_total", 0.0)),
+                    }
+                    for key, value in self._aggregate_pending_by_day.items()
+                },
+            }
+
+            self._aggregate_pending_count = 0
+            self._aggregate_pending_success_count = 0
+            self._aggregate_pending_pnl_total = 0.0
+            self._aggregate_pending_last_trade_id = ""
+            self._aggregate_pending_last_status = ""
+            self._aggregate_pending_by_day = {}
+            self._aggregate_last_flush_at = now_utc
+
+        if batch is None:
+            return
+
+        try:
+            await self._apply_trade_aggregate_batch(batch)
+        except Exception as error:
+            await self._merge_trade_aggregate_batch(batch)
+            log_event(
+                self._logger,
+                level="error",
+                event="trade_aggregate_flush_failed",
+                message="Failed to flush batched trade aggregates; re-queued pending aggregates",
+                error=str(error),
+                trade_count=batch["trade_count"],
+            )
+
+    async def _merge_trade_aggregate_batch(self, batch: dict[str, Any]) -> None:
+        async with self._aggregate_lock:
+            self._aggregate_pending_count += int(batch.get("trade_count", 0))
+            self._aggregate_pending_success_count += int(batch.get("successful_trade_count", 0))
+            self._aggregate_pending_pnl_total += float(batch.get("pnl_total", 0.0))
+            last_trade_id = str(batch.get("last_trade_id", ""))
+            last_status = str(batch.get("last_status", ""))
+            if last_trade_id:
+                self._aggregate_pending_last_trade_id = last_trade_id
+            if last_status:
+                self._aggregate_pending_last_status = last_status
+
+            for day_id, day_payload in batch.get("by_day", {}).items():
+                pending_day = self._aggregate_pending_by_day.setdefault(
+                    day_id,
+                    {"trade_count": 0.0, "successful_trade_count": 0.0, "pnl_total": 0.0},
+                )
+                pending_day["trade_count"] += float(day_payload.get("trade_count", 0))
+                pending_day["successful_trade_count"] += float(day_payload.get("successful_trade_count", 0))
+                pending_day["pnl_total"] += float(day_payload.get("pnl_total", 0.0))
+
+    async def _apply_trade_aggregate_batch(self, batch: dict[str, Any]) -> None:
+        if self._metrics_doc_ref is None or self._pnl_daily_collection_ref is None:
+            return
+
+        runtime_payload: dict[str, Any] = {
             "updated_at": firestore.SERVER_TIMESTAMP,
-            "trade_count": firestore.Increment(1),
-            "successful_trade_count": firestore.Increment(success_increment),
-            "pnl_total": firestore.Increment(float(pnl_delta)),
+            "trade_count": firestore.Increment(int(batch["trade_count"])),
+            "successful_trade_count": firestore.Increment(int(batch["successful_trade_count"])),
+            "pnl_total": firestore.Increment(float(batch["pnl_total"])),
             "bot_id": self.settings.bot_id,
             "env": self.settings.bot_env,
             "schema_version": self.settings.config_schema_version,
+            "run_id": self.settings.bot_run_id,
+            "last_trade_id": batch.get("last_trade_id", ""),
+            "last_status": batch.get("last_status", ""),
         }
 
-        runtime_payload = dict(base_payload)
-        runtime_payload["run_id"] = self.settings.bot_run_id
-        runtime_payload["last_trade_id"] = trade_id
-        runtime_payload["last_status"] = status
-
-        day_id = _utc_day_id()
-        daily_payload = dict(base_payload)
-        daily_payload["day_id"] = day_id
-
-        daily_doc_ref = self._pnl_daily_collection_ref.document(day_id)
-        await asyncio.gather(
+        writes: list[Awaitable[Any]] = [
             asyncio.to_thread(self._metrics_doc_ref.set, runtime_payload, merge=True),
-            asyncio.to_thread(daily_doc_ref.set, daily_payload, merge=True),
-        )
+        ]
+
+        for day_id, day_payload in batch.get("by_day", {}).items():
+            payload = {
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                "trade_count": firestore.Increment(int(day_payload.get("trade_count", 0))),
+                "successful_trade_count": firestore.Increment(
+                    int(day_payload.get("successful_trade_count", 0))
+                ),
+                "pnl_total": firestore.Increment(float(day_payload.get("pnl_total", 0.0))),
+                "bot_id": self.settings.bot_id,
+                "env": self.settings.bot_env,
+                "schema_version": self.settings.config_schema_version,
+                "day_id": day_id,
+            }
+            daily_doc_ref = self._pnl_daily_collection_ref.document(day_id)
+            writes.append(asyncio.to_thread(daily_doc_ref.set, payload, merge=True))
+
+        await asyncio.gather(*writes)
 
     async def _ensure_bot_namespace(self) -> None:
         if self._bot_doc_ref is None or self._run_doc_ref is None:

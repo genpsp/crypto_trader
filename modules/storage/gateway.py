@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 from google.cloud import firestore
@@ -32,6 +33,14 @@ class StorageGateway(FirestoreStorageOps, RedisStorageOps):
         self._config_doc_ref: Any | None = None
         self._watch: Any | None = None
         self._resolved_firestore_config_doc = self.settings.firestore_config_doc
+        self._aggregate_lock = asyncio.Lock()
+        self._aggregate_pending_count = 0
+        self._aggregate_pending_success_count = 0
+        self._aggregate_pending_pnl_total = 0.0
+        self._aggregate_pending_last_trade_id = ""
+        self._aggregate_pending_last_status = ""
+        self._aggregate_pending_by_day: dict[str, dict[str, float]] = {}
+        self._aggregate_last_flush_at = datetime.now(timezone.utc)
 
     @property
     def bot_id(self) -> str:
@@ -113,6 +122,9 @@ class StorageGateway(FirestoreStorageOps, RedisStorageOps):
             with contextlib.suppress(Exception):  # watcher uses sync callback threads; ignore close race
                 self._watch.unsubscribe()
             self._watch = None
+
+        with contextlib.suppress(Exception):
+            await self.flush_trade_aggregates(force=True)
 
         if self._redis is not None:
             close = getattr(self._redis, "aclose", None)

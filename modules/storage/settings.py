@@ -17,6 +17,23 @@ def to_int(value: Any, default: int) -> int:
         return default
 
 
+def to_float(value: Any, default: float) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def to_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(slots=True)
 class StorageSettings:
     redis_url: str
@@ -34,6 +51,9 @@ class StorageSettings:
     bot_pnl_daily_collection: str
     bot_metrics_collection: str
     bot_metrics_doc_id: str
+    firestore_publish_order_execution_events: bool
+    firestore_aggregate_batch_size: int
+    firestore_aggregate_flush_interval_seconds: float
     config_schema_version: int
     heartbeat_key: str
     price_prefix: str
@@ -46,7 +66,7 @@ class StorageSettings:
     def from_env(cls) -> "StorageSettings":
         bot_collection = (os.getenv("BOT_COLLECTION", "bots").strip("/") or "bots")
         bot_id = (os.getenv("BOT_ID", "solana-bot").strip() or "solana-bot").replace("/", "-")
-        default_config_doc = f"{bot_collection}/{bot_id}/configs"
+        default_config_doc = f"{bot_collection}/{bot_id}/config/runtime"
 
         return cls(
             redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
@@ -65,6 +85,18 @@ class StorageSettings:
             bot_pnl_daily_collection=os.getenv("BOT_PNL_DAILY_COLLECTION", "pnl_daily"),
             bot_metrics_collection=os.getenv("BOT_METRICS_COLLECTION", "metrics"),
             bot_metrics_doc_id=os.getenv("BOT_METRICS_DOC_ID", "runtime"),
+            firestore_publish_order_execution_events=to_bool(
+                os.getenv("FIRESTORE_PUBLISH_ORDER_EXECUTION_EVENTS"),
+                False,
+            ),
+            firestore_aggregate_batch_size=max(
+                1,
+                to_int(os.getenv("FIRESTORE_AGGREGATE_BATCH_SIZE"), 20),
+            ),
+            firestore_aggregate_flush_interval_seconds=max(
+                1.0,
+                to_float(os.getenv("FIRESTORE_AGGREGATE_FLUSH_INTERVAL_SECONDS"), 30.0),
+            ),
             config_schema_version=max(1, to_int(os.getenv("CONFIG_SCHEMA_VERSION"), 1)),
             heartbeat_key=os.getenv("REDIS_HEARTBEAT_KEY", "bot:heartbeat"),
             price_prefix=os.getenv("REDIS_PRICE_PREFIX", "prices"),

@@ -49,6 +49,16 @@ async def main() -> None:
             rpc_url=app_settings.solana_rpc_url,
             private_key=app_settings.private_key,
             order_store=storage,
+            swap_api_url=app_settings.jupiter_swap_api,
+            jupiter_api_key=app_settings.jupiter_api_key or None,
+            send_max_attempts=app_settings.live_send_max_attempts,
+            send_retry_backoff_seconds=app_settings.live_send_retry_backoff_seconds,
+            confirm_timeout_seconds=app_settings.live_confirm_timeout_seconds,
+            confirm_poll_interval_seconds=app_settings.live_confirm_poll_interval_seconds,
+            rebuild_max_attempts=app_settings.live_rebuild_max_attempts,
+            pending_guard_ttl_seconds=app_settings.live_pending_guard_ttl_seconds,
+            pending_recovery_limit=app_settings.live_pending_recovery_limit,
+            min_balance_lamports=app_settings.live_min_balance_lamports,
         )
 
     trader_engine = TraderEngine(logger=logger, watcher=watcher, executor=executor)

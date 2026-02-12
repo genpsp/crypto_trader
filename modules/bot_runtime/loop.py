@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from typing import Any
 
 from modules.common import guarded_call, log_event
@@ -36,6 +37,16 @@ async def wait_with_stop(stop_event: asyncio.Event, timeout_seconds: float) -> N
         await asyncio.wait_for(stop_event.wait(), timeout=timeout_seconds)
     except asyncio.TimeoutError:
         pass
+
+
+def estimate_execution_fee_lamports(
+    *,
+    priority_fee_micro_lamports: int,
+    priority_compute_units: int,
+    base_fee_lamports: int,
+) -> int:
+    priority_fee_lamports = int((priority_fee_micro_lamports * priority_compute_units) / 1_000_000)
+    return max(0, priority_fee_lamports) + max(0, base_fee_lamports)
 
 
 async def bootstrap_dependencies(
@@ -144,6 +155,125 @@ async def run_trading_loop(
 
     order_intake_paused = False
     pause_reason = ""
+    recent_execution_timestamps: deque[float] = deque()
+    recent_execution_fees: deque[tuple[float, int]] = deque()
+    recent_execution_fee_total = 0
+    recent_pnl_deltas: deque[tuple[float, float]] = deque()
+    recent_pnl_total = 0.0
+    last_execution_at = 0.0
+    consecutive_execution_errors = 0
+    execution_circuit_open_until = 0.0
+    drawdown_circuit_open_until = 0.0
+
+    async def open_execution_circuit(*, reason: str, error: str = "") -> None:
+        nonlocal execution_circuit_open_until, consecutive_execution_errors
+
+        cooldown_seconds = app_settings.live_execution_circuit_breaker_seconds
+        execution_circuit_open_until = loop.time() + cooldown_seconds
+        log_event(
+            logger,
+            level="warning",
+            event="execution_circuit_breaker_opened",
+            message="Execution circuit breaker opened after repeated execution errors",
+            reason=reason,
+            error=error,
+            cooldown_seconds=cooldown_seconds,
+            threshold=app_settings.live_max_consecutive_execution_errors,
+        )
+        await guarded_call(
+            lambda: storage.record_position(
+                {
+                    "pair": pair.symbol,
+                    "status": "execution_circuit_open",
+                    "reason": reason,
+                    "error": error,
+                }
+            ),
+            logger=logger,
+            event="execution_circuit_position_record_failed",
+            message="Failed to record execution circuit breaker state",
+        )
+        await guarded_call(
+            lambda: storage.publish_event(
+                level="WARNING",
+                event="execution_circuit_breaker_opened",
+                message="Execution circuit breaker opened",
+                details={
+                    "pair": pair.symbol,
+                    "reason": reason,
+                    "error": error,
+                    "cooldown_seconds": cooldown_seconds,
+                    "threshold": app_settings.live_max_consecutive_execution_errors,
+                },
+            ),
+            logger=logger,
+            event="execution_circuit_publish_failed",
+            message="Failed to publish execution circuit breaker event",
+        )
+        consecutive_execution_errors = 0
+
+    def refresh_recent_pnl(now_time: float) -> float:
+        nonlocal recent_pnl_total
+        window_seconds = app_settings.live_drawdown_window_seconds
+        while recent_pnl_deltas and (now_time - recent_pnl_deltas[0][0]) > window_seconds:
+            _, expired_delta = recent_pnl_deltas.popleft()
+            recent_pnl_total -= expired_delta
+        return max(0.0, -recent_pnl_total)
+
+    def record_realized_pnl(*, now_time: float, pnl_delta_lamports: float) -> None:
+        nonlocal recent_pnl_total
+        recent_pnl_deltas.append((now_time, pnl_delta_lamports))
+        recent_pnl_total += pnl_delta_lamports
+
+    async def open_drawdown_circuit(
+        *,
+        reason: str,
+        current_drawdown_lamports: float,
+    ) -> None:
+        nonlocal drawdown_circuit_open_until
+
+        cooldown_seconds = app_settings.live_drawdown_circuit_breaker_seconds
+        drawdown_circuit_open_until = loop.time() + cooldown_seconds
+        log_event(
+            logger,
+            level="warning",
+            event="drawdown_circuit_breaker_opened",
+            message="Drawdown circuit breaker opened",
+            reason=reason,
+            cooldown_seconds=cooldown_seconds,
+            current_drawdown_lamports=round(current_drawdown_lamports, 4),
+            max_drawdown_lamports=round(app_settings.live_max_drawdown_lamports, 4),
+        )
+        await guarded_call(
+            lambda: storage.record_position(
+                {
+                    "pair": pair.symbol,
+                    "status": "drawdown_circuit_open",
+                    "reason": reason,
+                    "current_drawdown_lamports": round(current_drawdown_lamports, 4),
+                }
+            ),
+            logger=logger,
+            event="drawdown_circuit_position_record_failed",
+            message="Failed to record drawdown circuit breaker state",
+        )
+        await guarded_call(
+            lambda: storage.publish_event(
+                level="WARNING",
+                event="drawdown_circuit_breaker_opened",
+                message="Drawdown circuit breaker opened",
+                details={
+                    "pair": pair.symbol,
+                    "reason": reason,
+                    "current_drawdown_lamports": round(current_drawdown_lamports, 4),
+                    "max_drawdown_lamports": round(app_settings.live_max_drawdown_lamports, 4),
+                    "cooldown_seconds": cooldown_seconds,
+                },
+            ),
+            logger=logger,
+            event="drawdown_circuit_publish_failed",
+            message="Failed to publish drawdown circuit breaker event",
+        )
 
     while not stop_event.is_set():
         transient_backoff_seconds = 0.0
@@ -231,14 +361,182 @@ async def run_trading_loop(
             await storage.update_heartbeat()
 
             if decision.should_execute:
+                now_time = loop.time()
+                if not app_settings.dry_run and app_settings.live_max_drawdown_lamports > 0:
+                    current_drawdown_lamports = refresh_recent_pnl(now_time)
+                    if current_drawdown_lamports >= app_settings.live_max_drawdown_lamports:
+                        if drawdown_circuit_open_until <= now_time:
+                            await open_drawdown_circuit(
+                                reason="drawdown_limit_exceeded",
+                                current_drawdown_lamports=current_drawdown_lamports,
+                            )
+                        continue
+
+                if (not app_settings.dry_run) and drawdown_circuit_open_until > now_time:
+                    remaining_seconds = max(0.0, drawdown_circuit_open_until - now_time)
+                    log_event(
+                        logger,
+                        level="warning",
+                        event="drawdown_circuit_open",
+                        message="Execution skipped because drawdown circuit breaker is open",
+                        remaining_seconds=round(remaining_seconds, 3),
+                    )
+                    continue
+
+                if (not app_settings.dry_run) and execution_circuit_open_until > now_time:
+                    remaining_seconds = max(0.0, execution_circuit_open_until - now_time)
+                    log_event(
+                        logger,
+                        level="warning",
+                        event="execution_circuit_open",
+                        message="Execution skipped because circuit breaker is open",
+                        remaining_seconds=round(remaining_seconds, 3),
+                    )
+                    continue
+
+                cooldown_seconds = app_settings.live_execution_cooldown_seconds
+                if cooldown_seconds > 0 and (now_time - last_execution_at) < cooldown_seconds:
+                    log_event(
+                        logger,
+                        level="warning",
+                        event="execution_cooldown_active",
+                        message="Execution skipped due to cooldown guard",
+                        cooldown_seconds=cooldown_seconds,
+                        remaining_seconds=round(cooldown_seconds - (now_time - last_execution_at), 3),
+                    )
+                    continue
+
+                window_seconds = app_settings.live_execution_window_seconds
+                while recent_execution_timestamps and (now_time - recent_execution_timestamps[0]) > window_seconds:
+                    recent_execution_timestamps.popleft()
+
+                if len(recent_execution_timestamps) >= app_settings.live_max_executions_per_window:
+                    log_event(
+                        logger,
+                        level="warning",
+                        event="execution_rate_limited",
+                        message="Execution skipped due to rate-limit guard",
+                        window_seconds=window_seconds,
+                        max_executions=app_settings.live_max_executions_per_window,
+                        current_count=len(recent_execution_timestamps),
+                    )
+                    continue
+
+                estimated_fee_lamports = 0
+                if not app_settings.dry_run:
+                    pending_records = await storage.list_order_records(
+                        statuses={"pending", "submitted", "pending_confirmation", "confirming"},
+                        limit=app_settings.live_max_pending_orders + 1,
+                    )
+                    pending_count = len(pending_records)
+                    if pending_count >= app_settings.live_max_pending_orders:
+                        log_event(
+                            logger,
+                            level="warning",
+                            event="execution_pending_guard",
+                            message="Execution skipped due to pending order guard",
+                            pending_count=pending_count,
+                            max_pending_orders=app_settings.live_max_pending_orders,
+                        )
+                        continue
+
+                    estimated_fee_lamports = estimate_execution_fee_lamports(
+                        priority_fee_micro_lamports=priority_fee_plan.selected_micro_lamports,
+                        priority_compute_units=runtime_config.priority_compute_units,
+                        base_fee_lamports=app_settings.live_estimated_base_fee_lamports,
+                    )
+
+                    fee_window_seconds = app_settings.live_fee_budget_window_seconds
+                    while recent_execution_fees and (now_time - recent_execution_fees[0][0]) > fee_window_seconds:
+                        _, expired_fee = recent_execution_fees.popleft()
+                        recent_execution_fee_total = max(0, recent_execution_fee_total - expired_fee)
+
+                    max_fee_per_window = app_settings.live_max_estimated_fee_lamports_per_window
+                    if max_fee_per_window > 0 and (
+                        recent_execution_fee_total + estimated_fee_lamports
+                    ) > max_fee_per_window:
+                        log_event(
+                            logger,
+                            level="warning",
+                            event="execution_fee_budget_guard",
+                            message="Execution skipped due to fee budget guard",
+                            fee_window_seconds=fee_window_seconds,
+                            estimated_fee_lamports=estimated_fee_lamports,
+                            current_window_fee_lamports=recent_execution_fee_total,
+                            max_window_fee_lamports=max_fee_per_window,
+                        )
+                        continue
+
                 idempotency_key = trader_engine.build_idempotency_key(pair=pair, observation=observation)
-                result = await trader_engine.execute(
-                    pair=pair,
-                    observation=observation,
-                    runtime_config=runtime_config,
-                    priority_fee_plan=priority_fee_plan,
-                    idempotency_key=idempotency_key,
-                )
+                try:
+                    result = await trader_engine.execute(
+                        pair=pair,
+                        observation=observation,
+                        runtime_config=runtime_config,
+                        priority_fee_plan=priority_fee_plan,
+                        idempotency_key=idempotency_key,
+                    )
+                except Exception as error:
+                    if not app_settings.dry_run and estimated_fee_lamports > 0:
+                        execution_time = loop.time()
+                        recent_execution_timestamps.append(execution_time)
+                        last_execution_at = execution_time
+                        recent_execution_fees.append((execution_time, estimated_fee_lamports))
+                        recent_execution_fee_total += estimated_fee_lamports
+                        record_realized_pnl(
+                            now_time=execution_time,
+                            pnl_delta_lamports=-float(estimated_fee_lamports),
+                        )
+                        current_drawdown_lamports = refresh_recent_pnl(execution_time)
+                        if (
+                            app_settings.live_max_drawdown_lamports > 0
+                            and current_drawdown_lamports >= app_settings.live_max_drawdown_lamports
+                        ):
+                            await open_drawdown_circuit(
+                                reason="execution_exception_fee_loss",
+                                current_drawdown_lamports=current_drawdown_lamports,
+                            )
+                    consecutive_execution_errors += 1
+                    log_event(
+                        logger,
+                        level="warning",
+                        event="execution_attempt_failed",
+                        message="Execution attempt failed",
+                        error=str(error),
+                        consecutive_errors=consecutive_execution_errors,
+                        threshold=app_settings.live_max_consecutive_execution_errors,
+                    )
+                    if (
+                        not app_settings.dry_run
+                        and consecutive_execution_errors >= app_settings.live_max_consecutive_execution_errors
+                    ):
+                        await open_execution_circuit(
+                            reason="consecutive_execution_errors",
+                            error=str(error),
+                        )
+                    continue
+
+                if result.status == "failed":
+                    consecutive_execution_errors += 1
+                    if (
+                        not app_settings.dry_run
+                        and consecutive_execution_errors >= app_settings.live_max_consecutive_execution_errors
+                    ):
+                        await open_execution_circuit(
+                            reason="execution_result_failed",
+                            error=result.reason,
+                        )
+                else:
+                    consecutive_execution_errors = 0
+
+                realized_pnl_lamports = to_float(result.metadata.get("pnl_delta"), 0.0)
+                if (
+                    not app_settings.dry_run
+                    and realized_pnl_lamports == 0.0
+                    and result.status not in {"skipped_duplicate", "skipped_max_fee", "skipped_low_balance"}
+                    and estimated_fee_lamports > 0
+                ):
+                    realized_pnl_lamports = -float(estimated_fee_lamports)
                 await storage.record_position(
                     {
                         "pair": pair.symbol,
@@ -263,23 +561,45 @@ async def run_trading_loop(
                         "total_fee_bps": decision.total_fee_bps,
                         "priority_fee_micro_lamports": result.priority_fee_micro_lamports,
                         "config_schema_version": runtime_config.config_schema_version,
-                        "pnl_delta": to_float(result.metadata.get("pnl_delta"), 0.0),
+                        "pnl_delta": realized_pnl_lamports,
                         "metadata": result.metadata,
                     },
                     trade_id=result.order_id,
                 )
-                await storage.publish_event(
-                    level="INFO",
-                    event="order_execution",
-                    message="Order execution attempted",
-                    details={
-                        "pair": pair.symbol,
-                        "decision_reason": decision.reason,
-                        "execution": result.to_dict(),
-                        "priority_fee_plan": priority_fee_plan.to_dict(),
-                    },
-                    event_id=f"order_execution:{result.order_id}",
-                )
+                if storage.settings.firestore_publish_order_execution_events:
+                    await storage.publish_event(
+                        level="INFO",
+                        event="order_execution",
+                        message="Order execution attempted",
+                        details={
+                            "pair": pair.symbol,
+                            "decision_reason": decision.reason,
+                            "execution": result.to_dict(),
+                            "priority_fee_plan": priority_fee_plan.to_dict(),
+                        },
+                        event_id=f"order_execution:{result.order_id}",
+                    )
+                if result.status not in {"skipped_duplicate", "skipped_max_fee", "skipped_low_balance"}:
+                    execution_time = loop.time()
+                    recent_execution_timestamps.append(execution_time)
+                    last_execution_at = execution_time
+                    if not app_settings.dry_run and estimated_fee_lamports > 0:
+                        recent_execution_fees.append((execution_time, estimated_fee_lamports))
+                        recent_execution_fee_total += estimated_fee_lamports
+                    if not app_settings.dry_run and realized_pnl_lamports != 0.0:
+                        record_realized_pnl(
+                            now_time=execution_time,
+                            pnl_delta_lamports=realized_pnl_lamports,
+                        )
+                        current_drawdown_lamports = refresh_recent_pnl(execution_time)
+                        if (
+                            app_settings.live_max_drawdown_lamports > 0
+                            and current_drawdown_lamports >= app_settings.live_max_drawdown_lamports
+                        ):
+                            await open_drawdown_circuit(
+                                reason="post_execution_drawdown_limit",
+                                current_drawdown_lamports=current_drawdown_lamports,
+                            )
 
             if decision.blocked_by_fee_cap and decision.profitable:
                 log_event(
