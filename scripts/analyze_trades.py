@@ -201,6 +201,16 @@ class TradeRow:
     atomic_mode: str
     send_mode_requested: str
     plan_id: str
+    metrics_source: str
+    initial_present: bool
+    plan_present: bool
+    initial_spread_bps: float | None
+    initial_total_fee_bps: float | None
+    initial_required_spread_bps: float | None
+    initial_expected_net_bps: float | None
+    plan_expected_fee_bps: float | None
+    plan_required_spread_bps: float | None
+    plan_expected_net_bps: float | None
     spread_bps: float | None
     total_fee_bps: float | None
     required_spread_bps: float | None
@@ -257,6 +267,44 @@ class AggregateSummary:
     realized_pnl_raw_total: float
     realized_pnl_base_total: float
     realized_positive_rate: float
+
+
+@dataclass(slots=True)
+class InitialMetricsSummary:
+    count_initial: int
+    skipped_count: int
+    required_spread_bps_avg: float
+    spread_bps_avg: float
+    total_fee_bps_avg: float
+    initial_expected_net_bps_avg: float
+    initial_expected_net_bps_p10: float
+    initial_expected_net_bps_p50: float
+    initial_expected_net_bps_p90: float
+    initial_expected_net_positive_rate: float
+    estimated_pnl_raw_total: float
+    estimated_pnl_base_total: float
+
+
+@dataclass(slots=True)
+class PlanMetricsSummary:
+    count_plan: int
+    skipped_count: int
+    plan_expected_fee_bps_avg: float
+    plan_required_spread_bps_avg: float
+    plan_expected_net_bps_avg: float
+    plan_expected_net_bps_p10: float
+    plan_expected_net_bps_p50: float
+    plan_expected_net_bps_p90: float
+    plan_expected_net_positive_rate: float
+    estimated_pnl_raw_total: float
+    estimated_pnl_base_total: float
+
+
+@dataclass(slots=True)
+class SplitMetricsDiagnostics:
+    both_present_count: int
+    source_counts: dict[str, int]
+    count_unknown: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -402,6 +450,37 @@ def parse_trade_row(
     metadata_raw = payload.get("metadata")
     metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
 
+    initial_spread_bps = to_float(payload.get("spread_bps"))
+    initial_total_fee_bps = to_float(payload.get("total_fee_bps"))
+    initial_required_spread_bps = to_float(payload.get("required_spread_bps"))
+    initial_expected_net_bps: float | None = None
+    if initial_spread_bps is not None and initial_required_spread_bps is not None:
+        initial_expected_net_bps = initial_spread_bps - initial_required_spread_bps
+
+    plan_expected_net_bps = to_float(metadata.get("expected_net_bps"))
+    plan_required_spread_bps = to_float(metadata.get("required_spread_bps"))
+    plan_expected_fee_bps = to_float(metadata.get("expected_fee_bps"))
+
+    initial_present = (
+        initial_spread_bps is not None
+        and initial_total_fee_bps is not None
+        and initial_required_spread_bps is not None
+    )
+    plan_present = plan_expected_net_bps is not None
+
+    explicit_metrics_source = str(payload.get("metrics_source") or metadata.get("metrics_source") or "").strip().lower()
+    if explicit_metrics_source in {"initial", "plan"}:
+        metrics_source = explicit_metrics_source
+    elif plan_present and not initial_present:
+        metrics_source = "plan"
+    elif initial_present and not plan_present:
+        metrics_source = "initial"
+    elif initial_present and plan_present:
+        # Default to plan when both are present to prevent cross-mixing inside a single aggregate lane.
+        metrics_source = "plan"
+    else:
+        metrics_source = "unknown"
+
     spread_bps = to_float(payload.get("spread_bps"))
     if spread_bps is None:
         spread_bps = to_float(metadata.get("observed_spread_bps"))
@@ -471,6 +550,16 @@ def parse_trade_row(
         atomic_mode=atomic_mode,
         send_mode_requested=send_mode_requested,
         plan_id=str(metadata.get("plan_id") or "").strip(),
+        metrics_source=metrics_source,
+        initial_present=initial_present,
+        plan_present=plan_present,
+        initial_spread_bps=initial_spread_bps,
+        initial_total_fee_bps=initial_total_fee_bps,
+        initial_required_spread_bps=initial_required_spread_bps,
+        initial_expected_net_bps=initial_expected_net_bps,
+        plan_expected_fee_bps=plan_expected_fee_bps,
+        plan_required_spread_bps=plan_required_spread_bps,
+        plan_expected_net_bps=plan_expected_net_bps,
         spread_bps=spread_bps,
         total_fee_bps=total_fee_bps,
         required_spread_bps=required_spread_bps,
@@ -483,6 +572,86 @@ def parse_trade_row(
         est_pnl_raw=est_pnl_raw,
         est_pnl_base=est_pnl_base,
     )
+
+
+def build_split_summaries(
+    *,
+    rows: list[TradeRow],
+    base_decimals: int,
+) -> tuple[InitialMetricsSummary, PlanMetricsSummary, SplitMetricsDiagnostics]:
+    both_present_count = sum(1 for row in rows if row.initial_present and row.plan_present)
+    source_counts = Counter((row.metrics_source or "unknown") for row in rows)
+
+    selected_initial = [row for row in rows if row.metrics_source == "initial"]
+    selected_plan = [row for row in rows if row.metrics_source == "plan"]
+
+    initial_complete = [row for row in selected_initial if row.initial_expected_net_bps is not None]
+    plan_complete = [row for row in selected_plan if row.plan_expected_net_bps is not None]
+
+    initial_spreads = [row.initial_spread_bps for row in initial_complete if row.initial_spread_bps is not None]
+    initial_fees = [row.initial_total_fee_bps for row in initial_complete if row.initial_total_fee_bps is not None]
+    initial_requireds = [
+        row.initial_required_spread_bps for row in initial_complete if row.initial_required_spread_bps is not None
+    ]
+    initial_expected_nets = [row.initial_expected_net_bps for row in initial_complete if row.initial_expected_net_bps is not None]
+
+    plan_expected_fees = [row.plan_expected_fee_bps for row in plan_complete if row.plan_expected_fee_bps is not None]
+    plan_requireds = [row.plan_required_spread_bps for row in plan_complete if row.plan_required_spread_bps is not None]
+    plan_expected_nets = [row.plan_expected_net_bps for row in plan_complete if row.plan_expected_net_bps is not None]
+
+    initial_estimated_pnl_raw_total = sum(
+        (row.amount_in_raw * row.initial_expected_net_bps / 10_000)
+        for row in initial_complete
+        if row.initial_expected_net_bps is not None
+    )
+    plan_estimated_pnl_raw_total = sum(
+        (row.amount_in_raw * row.plan_expected_net_bps / 10_000)
+        for row in plan_complete
+        if row.plan_expected_net_bps is not None
+    )
+
+    summary_initial = InitialMetricsSummary(
+        count_initial=len(initial_complete),
+        skipped_count=max(0, len(selected_initial) - len(initial_complete)),
+        required_spread_bps_avg=(sum(initial_requireds) / len(initial_requireds)) if initial_requireds else 0.0,
+        spread_bps_avg=(sum(initial_spreads) / len(initial_spreads)) if initial_spreads else 0.0,
+        total_fee_bps_avg=(sum(initial_fees) / len(initial_fees)) if initial_fees else 0.0,
+        initial_expected_net_bps_avg=(sum(initial_expected_nets) / len(initial_expected_nets)) if initial_expected_nets else 0.0,
+        initial_expected_net_bps_p10=percentile(initial_expected_nets, 0.10),
+        initial_expected_net_bps_p50=percentile(initial_expected_nets, 0.50),
+        initial_expected_net_bps_p90=percentile(initial_expected_nets, 0.90),
+        initial_expected_net_positive_rate=safe_rate(
+            sum(1 for value in initial_expected_nets if value > 0),
+            len(initial_expected_nets),
+        ),
+        estimated_pnl_raw_total=initial_estimated_pnl_raw_total,
+        estimated_pnl_base_total=initial_estimated_pnl_raw_total / (10**base_decimals),
+    )
+
+    summary_plan = PlanMetricsSummary(
+        count_plan=len(plan_complete),
+        skipped_count=max(0, len(selected_plan) - len(plan_complete)),
+        plan_expected_fee_bps_avg=(sum(plan_expected_fees) / len(plan_expected_fees)) if plan_expected_fees else 0.0,
+        plan_required_spread_bps_avg=(sum(plan_requireds) / len(plan_requireds)) if plan_requireds else 0.0,
+        plan_expected_net_bps_avg=(sum(plan_expected_nets) / len(plan_expected_nets)) if plan_expected_nets else 0.0,
+        plan_expected_net_bps_p10=percentile(plan_expected_nets, 0.10),
+        plan_expected_net_bps_p50=percentile(plan_expected_nets, 0.50),
+        plan_expected_net_bps_p90=percentile(plan_expected_nets, 0.90),
+        plan_expected_net_positive_rate=safe_rate(
+            sum(1 for value in plan_expected_nets if value > 0),
+            len(plan_expected_nets),
+        ),
+        estimated_pnl_raw_total=plan_estimated_pnl_raw_total,
+        estimated_pnl_base_total=plan_estimated_pnl_raw_total / (10**base_decimals),
+    )
+
+    diagnostics = SplitMetricsDiagnostics(
+        both_present_count=both_present_count,
+        source_counts=dict(source_counts),
+        count_unknown=source_counts.get("unknown", 0),
+    )
+
+    return summary_initial, summary_plan, diagnostics
 
 
 def build_summary(
@@ -583,7 +752,12 @@ def build_summary(
     )
 
 
-def build_recommendations(summary: AggregateSummary, *, target_net_bps: float) -> list[str]:
+def build_recommendations(
+    summary: AggregateSummary,
+    *,
+    summary_plan: PlanMetricsSummary,
+    target_net_bps: float,
+) -> list[str]:
     suggestions: list[str] = []
     if summary.matched_docs == 0:
         return ["No trades matched the filter. Expand --since-hours or remove filters."]
@@ -623,9 +797,10 @@ def build_recommendations(summary: AggregateSummary, *, target_net_bps: float) -
             )
         )
 
-    if summary.expected_net_bps_p10 < 0:
+    plan_p10 = summary_plan.plan_expected_net_bps_p10 if summary_plan.count_plan > 0 else summary.expected_net_bps_p10
+    if plan_p10 < 0:
         suggestions.append(
-            "Atomic re-quote edge has negative tail (expected_net_bps p10 < 0). "
+            "Atomic re-quote edge has negative tail (plan_expected_net_bps p10 < 0). "
             "Raise ATOMIC_MARGIN_BPS or tighten staleness/latency controls."
         )
 
@@ -661,6 +836,16 @@ def write_csv(path: Path, rows: list[TradeRow]) -> None:
                 "atomic_mode",
                 "send_mode_requested",
                 "plan_id",
+                "metrics_source",
+                "initial_present",
+                "plan_present",
+                "initial_spread_bps",
+                "initial_total_fee_bps",
+                "initial_required_spread_bps",
+                "initial_expected_net_bps",
+                "plan_expected_fee_bps",
+                "plan_required_spread_bps",
+                "plan_expected_net_bps",
                 "spread_bps",
                 "total_fee_bps",
                 "required_spread_bps",
@@ -795,7 +980,15 @@ def main() -> None:
         mode_filter=mode_filter,
         base_decimals=max(0, int(args.base_decimals)),
     )
-    recommendations = build_recommendations(summary, target_net_bps=args.target_net_bps)
+    summary_initial, summary_plan, split_diagnostics = build_split_summaries(
+        rows=rows,
+        base_decimals=max(0, int(args.base_decimals)),
+    )
+    recommendations = build_recommendations(
+        summary,
+        summary_plan=summary_plan,
+        target_net_bps=args.target_net_bps,
+    )
 
     if args.csv:
         write_csv((repo_root / args.csv).resolve(), rows)
@@ -814,6 +1007,9 @@ def main() -> None:
     if args.json:
         output = {
             "summary": asdict(summary),
+            "summary_initial": asdict(summary_initial),
+            "summary_plan": asdict(summary_plan),
+            "split_metrics": asdict(split_diagnostics),
             "fx": {
                 "base_symbol": str(args.base_symbol),
                 "base_price_usd": float(args.sol_price_usd),
@@ -877,6 +1073,57 @@ def main() -> None:
             f"  realized_pnl_usd_total={format_float(realized_usd_total, 4)} "
             f"realized_pnl_jpy_total={format_float(realized_jpy_total, 2)}"
         )
+    print("")
+    print("[summary_initial]")
+    print(
+        f"  count_initial={summary_initial.count_initial} skipped_count={summary_initial.skipped_count} "
+        f"both_present_count={split_diagnostics.both_present_count}"
+    )
+    print(
+        f"  spread_bps_avg={summary_initial.spread_bps_avg:.4f} "
+        f"total_fee_bps_avg={summary_initial.total_fee_bps_avg:.4f} "
+        f"required_spread_bps_avg={summary_initial.required_spread_bps_avg:.4f}"
+    )
+    print(
+        f"  initial_expected_net_bps_avg={summary_initial.initial_expected_net_bps_avg:.4f} "
+        f"p10={summary_initial.initial_expected_net_bps_p10:.4f} "
+        f"p50={summary_initial.initial_expected_net_bps_p50:.4f} "
+        f"p90={summary_initial.initial_expected_net_bps_p90:.4f} "
+        f"positive_rate={summary_initial.initial_expected_net_positive_rate:.2%}"
+    )
+    print(
+        f"  estimated_pnl_raw_total={summary_initial.estimated_pnl_raw_total:.6f} "
+        f"estimated_pnl_{base_symbol}_total={summary_initial.estimated_pnl_base_total:.10f}"
+    )
+    print("")
+    print("[summary_plan]")
+    print(
+        f"  count_plan={summary_plan.count_plan} skipped_count={summary_plan.skipped_count} "
+        f"both_present_count={split_diagnostics.both_present_count}"
+    )
+    print(
+        f"  plan_expected_fee_bps_avg={summary_plan.plan_expected_fee_bps_avg:.4f} "
+        f"plan_required_spread_bps_avg={summary_plan.plan_required_spread_bps_avg:.4f}"
+    )
+    print(
+        f"  plan_expected_net_bps_avg={summary_plan.plan_expected_net_bps_avg:.4f} "
+        f"p10={summary_plan.plan_expected_net_bps_p10:.4f} "
+        f"p50={summary_plan.plan_expected_net_bps_p50:.4f} "
+        f"p90={summary_plan.plan_expected_net_bps_p90:.4f} "
+        f"positive_rate={summary_plan.plan_expected_net_positive_rate:.2%}"
+    )
+    print(
+        f"  estimated_pnl_raw_total={summary_plan.estimated_pnl_raw_total:.6f} "
+        f"estimated_pnl_{base_symbol}_total={summary_plan.estimated_pnl_base_total:.10f}"
+    )
+    print("")
+    print("[split_metrics]")
+    print(
+        f"  both_present_count={split_diagnostics.both_present_count} "
+        f"count_unknown={split_diagnostics.count_unknown}"
+    )
+    for key, value in sorted(split_diagnostics.source_counts.items(), key=lambda item: item[0]):
+        print(f"  source_{key}={value}")
     print("")
     print("[execution]")
     print(

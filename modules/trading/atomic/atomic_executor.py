@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Protocol
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -55,6 +58,22 @@ def _is_jito_rate_limit_message(message: str) -> bool:
             "try again later",
         )
     )
+
+
+def _normalize_jito_endpoints(raw: str) -> list[str]:
+    values: list[str] = []
+    for token in (raw or "").replace("\n", ",").split(","):
+        endpoint = token.strip()
+        if endpoint and endpoint not in values:
+            values.append(endpoint)
+    return values
+
+
+def _endpoint_for_log(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    if not parsed.scheme or not parsed.netloc:
+        return endpoint
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
 class AtomicPendingStore(Protocol):
@@ -262,6 +281,7 @@ class AtomicPendingManager:
         fetch_signature_status: Callable[[str], Awaitable[dict[str, Any] | None]],
         ttl_seconds: int,
         limit: int,
+        stale_after_seconds: float | None = None,
     ) -> AtomicRecoverySummary:
         if self._store is None:
             return AtomicRecoverySummary(scanned=0, resolved=0, unresolved=0)
@@ -275,6 +295,21 @@ class AtomicPendingManager:
 
         resolved = 0
         unresolved = 0
+        now_epoch = datetime.now(timezone.utc).timestamp()
+
+        def parse_iso_timestamp(value: Any) -> float | None:
+            raw = str(value or "").strip()
+            if not raw:
+                return None
+            normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+            try:
+                return datetime.fromisoformat(normalized).timestamp()
+            except ValueError:
+                return None
+
+        stale_threshold = None
+        if stale_after_seconds is not None and stale_after_seconds > 0:
+            stale_threshold = float(stale_after_seconds)
 
         for record in records:
             plan_id = str(record.get("plan_id") or "").strip()
@@ -283,6 +318,12 @@ class AtomicPendingManager:
             tx_signatures = record.get("tx_signatures")
             signatures = tx_signatures if isinstance(tx_signatures, list) else []
             signatures = [str(sig).strip() for sig in signatures if str(sig).strip()]
+            updated_at_ts = parse_iso_timestamp(record.get("updated_at"))
+            created_at_ts = parse_iso_timestamp(record.get("created_at"))
+            age_seconds = None
+            anchor_ts = created_at_ts if created_at_ts is not None else updated_at_ts
+            if anchor_ts is not None:
+                age_seconds = max(0.0, now_epoch - anchor_ts)
 
             if not plan_id or not order_id or not guard_key or not signatures:
                 unresolved += 1
@@ -364,6 +405,46 @@ class AtomicPendingManager:
                 )
                 continue
 
+            if (
+                stale_threshold is not None
+                and age_seconds is not None
+                and age_seconds >= stale_threshold
+            ):
+                resolved += 1
+                stale_reason = "pending_recovery_stale_timeout"
+                log_event(
+                    self._logger,
+                    level="warning",
+                    event="atomic_recovery_stale_pending_cleared",
+                    message="Pending atomic record exceeded stale timeout and was force-cleared",
+                    plan_id=plan_id,
+                    order_id=order_id,
+                    pending_age_seconds=round(age_seconds, 3),
+                    stale_after_seconds=round(stale_threshold, 3),
+                )
+                await self.mark_failed(
+                    plan_id=plan_id,
+                    order_id=order_id,
+                    guard_key=guard_key,
+                    tx_signatures=signatures,
+                    ttl_seconds=ttl_seconds,
+                    payload={
+                        "recovered": True,
+                        "reason": stale_reason,
+                        "pending_age_seconds": age_seconds,
+                    },
+                )
+                await guarded_call(
+                    lambda: self._store.release_order_guard(guard_key=guard_key, order_id=order_id),
+                    logger=self._logger,
+                    event="atomic_recovery_release_guard_failed",
+                    message="Failed to release order guard after stale atomic recovery",
+                    level="warning",
+                    plan_id=plan_id,
+                    order_id=order_id,
+                )
+                continue
+
             unresolved += 1
             await guarded_call(
                 lambda: self._store.refresh_order_guard(
@@ -390,18 +471,62 @@ class JitoBlockEngineClient:
         block_engine_url: str,
     ) -> None:
         self._logger = logger
-        self._block_engine_url = block_engine_url.strip()
-        self._tip_accounts_cache: list[str] = []
+        self._block_engine_urls = _normalize_jito_endpoints(block_engine_url)
+        self._active_endpoint_index = 0
+        self._tip_accounts_cache_by_endpoint: dict[str, list[str]] = {}
 
     @property
     def block_engine_url(self) -> str:
-        return self._block_engine_url
+        endpoints = self._block_engine_urls
+        if not endpoints:
+            return ""
+        if self._active_endpoint_index >= len(endpoints):
+            self._active_endpoint_index = 0
+        return endpoints[self._active_endpoint_index]
+
+    @property
+    def block_engine_urls(self) -> list[str]:
+        return list(self._block_engine_urls)
 
     def update_endpoint(self, block_engine_url: str) -> None:
-        updated = (block_engine_url or "").strip()
-        if updated != self._block_engine_url:
-            self._tip_accounts_cache = []
-        self._block_engine_url = updated
+        updated = _normalize_jito_endpoints(block_engine_url)
+        if updated != self._block_engine_urls:
+            self._tip_accounts_cache_by_endpoint = {}
+            self._active_endpoint_index = 0
+        self._block_engine_urls = updated
+
+    def _iter_endpoints(self) -> list[str]:
+        endpoints = self._block_engine_urls
+        if not endpoints:
+            return []
+        active = self.block_engine_url
+        if not active:
+            return list(endpoints)
+        return [active, *[endpoint for endpoint in endpoints if endpoint != active]]
+
+    def _promote_endpoint(self, endpoint: str) -> None:
+        if endpoint not in self._block_engine_urls:
+            return
+        self._active_endpoint_index = self._block_engine_urls.index(endpoint)
+
+    def _log_failover(
+        self,
+        *,
+        event: str,
+        message: str,
+        from_endpoint: str,
+        to_endpoint: str,
+        error: str,
+    ) -> None:
+        log_event(
+            self._logger,
+            level="warning",
+            event=event,
+            message=message,
+            from_endpoint=_endpoint_for_log(from_endpoint),
+            to_endpoint=_endpoint_for_log(to_endpoint),
+            error=error,
+        )
 
     async def fetch_tip_accounts(
         self,
@@ -409,10 +534,8 @@ class JitoBlockEngineClient:
         session: aiohttp.ClientSession,
         force_refresh: bool = False,
     ) -> list[str]:
-        if self._tip_accounts_cache and not force_refresh:
-            return list(self._tip_accounts_cache)
-
-        if not self._block_engine_url:
+        endpoints = self._iter_endpoints()
+        if not endpoints:
             raise RuntimeError("JITO_BLOCK_ENGINE_URL is required for bundle mode.")
 
         payload = {
@@ -421,40 +544,165 @@ class JitoBlockEngineClient:
             "method": "getTipAccounts",
             "params": [],
         }
+        last_error: Exception | None = None
 
-        async with session.post(self._block_engine_url, json=payload) as response:
-            status = response.status
-            raw_text = await response.text()
+        for idx, endpoint in enumerate(endpoints, start=1):
+            cached = self._tip_accounts_cache_by_endpoint.get(endpoint)
+            if cached and not force_refresh:
+                self._promote_endpoint(endpoint)
+                return list(cached)
 
-        parsed: Any = None
-        try:
-            parsed = json.loads(raw_text) if raw_text else {}
-        except json.JSONDecodeError:
-            parsed = {"raw": raw_text}
+            try:
+                async with session.post(endpoint, json=payload) as response:
+                    status = response.status
+                    retry_after_seconds = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+                    raw_text = await response.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                last_error = RuntimeError(f"Jito getTipAccounts request failed: {error}")
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_tip_accounts_endpoint_failover",
+                        message="Switching Jito endpoint after tip-account fetch transport failure",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(error),
+                    )
+                    continue
+                raise last_error from error
 
-        if status >= 400:
-            raise RuntimeError(f"Jito getTipAccounts failed: status={status} body={str(raw_text)[:240]!r}")
+            parsed: Any = None
+            try:
+                parsed = json.loads(raw_text) if raw_text else {}
+            except json.JSONDecodeError:
+                parsed = {"raw": raw_text}
 
-        if isinstance(parsed, dict) and parsed.get("error"):
-            raise RuntimeError(f"Jito getTipAccounts failed: {parsed['error']}")
+            if status == 429:
+                rate_error = JitoBundleRateLimitError(
+                    f"Jito getTipAccounts failed: status={status} body={str(raw_text)[:240]!r}",
+                    retry_after_seconds=retry_after_seconds,
+                )
+                last_error = rate_error
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_tip_accounts_endpoint_failover",
+                        message="Switching Jito endpoint after tip-account rate limit",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(rate_error),
+                    )
+                    continue
+                raise rate_error
 
-        result = parsed.get("result") if isinstance(parsed, dict) else None
-        if not isinstance(result, list):
-            raise RuntimeError(f"Unexpected getTipAccounts response: {parsed}")
+            if status >= 400:
+                error_message = str(raw_text)
+                if isinstance(parsed, dict) and parsed.get("error") is not None:
+                    error_message = _error_message_from_payload(parsed.get("error"))
+                if _is_jito_rate_limit_message(error_message):
+                    rate_error = JitoBundleRateLimitError(
+                        f"Jito getTipAccounts rate-limited: status={status} error={error_message}",
+                        retry_after_seconds=retry_after_seconds,
+                    )
+                    last_error = rate_error
+                    if idx < len(endpoints):
+                        self._log_failover(
+                            event="jito_tip_accounts_endpoint_failover",
+                            message="Switching Jito endpoint after tip-account rate limit",
+                            from_endpoint=endpoint,
+                            to_endpoint=endpoints[idx],
+                            error=str(rate_error),
+                        )
+                        continue
+                    raise rate_error
 
-        tip_accounts = [str(item).strip() for item in result if str(item).strip()]
-        if not tip_accounts:
-            raise RuntimeError("Jito getTipAccounts returned no tip accounts.")
+                last_error = RuntimeError(
+                    f"Jito getTipAccounts failed: status={status} body={str(raw_text)[:240]!r}"
+                )
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_tip_accounts_endpoint_failover",
+                        message="Switching Jito endpoint after tip-account response error",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(last_error),
+                    )
+                    continue
+                raise last_error
 
-        self._tip_accounts_cache = tip_accounts
-        log_event(
-            self._logger,
-            level="info",
-            event="jito_tip_accounts_loaded",
-            message="Loaded Jito tip accounts",
-            tip_account_count=len(tip_accounts),
-        )
-        return list(tip_accounts)
+            if isinstance(parsed, dict) and parsed.get("error"):
+                error_payload = parsed["error"]
+                error_message = _error_message_from_payload(error_payload)
+                if _is_jito_rate_limit_message(error_message):
+                    rate_error = JitoBundleRateLimitError(
+                        f"Jito getTipAccounts rate-limited: {error_message}",
+                        retry_after_seconds=retry_after_seconds,
+                    )
+                    last_error = rate_error
+                    if idx < len(endpoints):
+                        self._log_failover(
+                            event="jito_tip_accounts_endpoint_failover",
+                            message="Switching Jito endpoint after tip-account RPC rate limit",
+                            from_endpoint=endpoint,
+                            to_endpoint=endpoints[idx],
+                            error=str(rate_error),
+                        )
+                        continue
+                    raise rate_error
+
+                last_error = RuntimeError(f"Jito getTipAccounts failed: {error_payload}")
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_tip_accounts_endpoint_failover",
+                        message="Switching Jito endpoint after tip-account RPC error",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(last_error),
+                    )
+                    continue
+                raise last_error
+
+            result = parsed.get("result") if isinstance(parsed, dict) else None
+            if not isinstance(result, list):
+                last_error = RuntimeError(f"Unexpected getTipAccounts response: {parsed}")
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_tip_accounts_endpoint_failover",
+                        message="Switching Jito endpoint after malformed tip-account response",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(last_error),
+                    )
+                    continue
+                raise last_error
+
+            tip_accounts = [str(item).strip() for item in result if str(item).strip()]
+            if not tip_accounts:
+                last_error = RuntimeError("Jito getTipAccounts returned no tip accounts.")
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_tip_accounts_endpoint_failover",
+                        message="Switching Jito endpoint after empty tip-account response",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(last_error),
+                    )
+                    continue
+                raise last_error
+
+            self._tip_accounts_cache_by_endpoint[endpoint] = tip_accounts
+            self._promote_endpoint(endpoint)
+            log_event(
+                self._logger,
+                level="info",
+                event="jito_tip_accounts_loaded",
+                message="Loaded Jito tip accounts",
+                tip_account_count=len(tip_accounts),
+                endpoint=_endpoint_for_log(endpoint),
+            )
+            return list(tip_accounts)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Jito getTipAccounts failed: no endpoint available.")
 
     async def select_tip_account(
         self,
@@ -476,7 +724,8 @@ class JitoBlockEngineClient:
         tip_lamports: int,
         plan_id: str,
     ) -> str | None:
-        if not self._block_engine_url:
+        endpoints = self._iter_endpoints()
+        if not endpoints:
             raise RuntimeError("JITO_BLOCK_ENGINE_URL is required for bundle mode.")
 
         payload = {
@@ -492,66 +741,140 @@ class JitoBlockEngineClient:
             ],
         }
 
-        async with session.post(self._block_engine_url, json=payload) as response:
-            status = response.status
-            retry_after_seconds = _parse_retry_after_seconds(response.headers.get("Retry-After"))
-            raw_text = await response.text()
+        last_error: Exception | None = None
 
-        parsed: Any = None
-        try:
-            parsed = json.loads(raw_text) if raw_text else {}
-        except json.JSONDecodeError:
-            parsed = {"raw": raw_text}
+        for idx, endpoint in enumerate(endpoints, start=1):
+            try:
+                async with session.post(endpoint, json=payload) as response:
+                    status = response.status
+                    retry_after_seconds = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+                    raw_text = await response.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                last_error = RuntimeError(f"Jito bundle submission request failed: {error}")
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_bundle_endpoint_failover",
+                        message="Switching Jito endpoint after bundle submit transport failure",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(error),
+                    )
+                    continue
+                raise last_error from error
 
-        if status == 429:
-            raise JitoBundleRateLimitError(
-                f"Jito bundle submission failed: status={status} body={str(raw_text)[:240]!r}",
-                retry_after_seconds=retry_after_seconds,
-            )
+            parsed: Any = None
+            try:
+                parsed = json.loads(raw_text) if raw_text else {}
+            except json.JSONDecodeError:
+                parsed = {"raw": raw_text}
 
-        if status >= 400:
-            error_message = str(raw_text)
-            if isinstance(parsed, dict) and parsed.get("error") is not None:
-                error_message = _error_message_from_payload(parsed.get("error"))
-            if _is_jito_rate_limit_message(error_message):
-                raise JitoBundleRateLimitError(
-                    f"Jito bundle submission rate-limited: status={status} error={error_message}",
+            if status == 429:
+                rate_error = JitoBundleRateLimitError(
+                    f"Jito bundle submission failed: status={status} body={str(raw_text)[:240]!r}",
                     retry_after_seconds=retry_after_seconds,
                 )
-            raise RuntimeError(
-                f"Jito bundle submission failed: status={status} body={str(raw_text)[:240]!r}"
-            )
+                last_error = rate_error
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_bundle_endpoint_failover",
+                        message="Switching Jito endpoint after bundle submit rate limit",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(rate_error),
+                    )
+                    continue
+                raise rate_error
 
-        if isinstance(parsed, dict) and parsed.get("error"):
-            error_payload = parsed["error"]
-            error_message = _error_message_from_payload(error_payload)
-            if _is_jito_rate_limit_message(error_message):
-                raise JitoBundleRateLimitError(
-                    f"Jito bundle submission rate-limited: {error_message}",
-                    retry_after_seconds=retry_after_seconds,
+            if status >= 400:
+                error_message = str(raw_text)
+                if isinstance(parsed, dict) and parsed.get("error") is not None:
+                    error_message = _error_message_from_payload(parsed.get("error"))
+                if _is_jito_rate_limit_message(error_message):
+                    rate_error = JitoBundleRateLimitError(
+                        f"Jito bundle submission rate-limited: status={status} error={error_message}",
+                        retry_after_seconds=retry_after_seconds,
+                    )
+                    last_error = rate_error
+                    if idx < len(endpoints):
+                        self._log_failover(
+                            event="jito_bundle_endpoint_failover",
+                            message="Switching Jito endpoint after bundle submit rate limit",
+                            from_endpoint=endpoint,
+                            to_endpoint=endpoints[idx],
+                            error=str(rate_error),
+                        )
+                        continue
+                    raise rate_error
+                last_error = RuntimeError(
+                    f"Jito bundle submission failed: status={status} body={str(raw_text)[:240]!r}"
                 )
-            raise RuntimeError(f"Jito bundle submission failed: {error_payload}")
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_bundle_endpoint_failover",
+                        message="Switching Jito endpoint after bundle submit response error",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(last_error),
+                    )
+                    continue
+                raise last_error
 
-        bundle_id = None
-        if isinstance(parsed, dict):
-            result = parsed.get("result")
-            if isinstance(result, str):
-                bundle_id = result
-            elif isinstance(result, dict):
-                bundle_id = str(result.get("bundleId") or result.get("id") or "") or None
+            if isinstance(parsed, dict) and parsed.get("error"):
+                error_payload = parsed["error"]
+                error_message = _error_message_from_payload(error_payload)
+                if _is_jito_rate_limit_message(error_message):
+                    rate_error = JitoBundleRateLimitError(
+                        f"Jito bundle submission rate-limited: {error_message}",
+                        retry_after_seconds=retry_after_seconds,
+                    )
+                    last_error = rate_error
+                    if idx < len(endpoints):
+                        self._log_failover(
+                            event="jito_bundle_endpoint_failover",
+                            message="Switching Jito endpoint after bundle submit RPC rate limit",
+                            from_endpoint=endpoint,
+                            to_endpoint=endpoints[idx],
+                            error=str(rate_error),
+                        )
+                        continue
+                    raise rate_error
+                last_error = RuntimeError(f"Jito bundle submission failed: {error_payload}")
+                if idx < len(endpoints):
+                    self._log_failover(
+                        event="jito_bundle_endpoint_failover",
+                        message="Switching Jito endpoint after bundle submit RPC error",
+                        from_endpoint=endpoint,
+                        to_endpoint=endpoints[idx],
+                        error=str(last_error),
+                    )
+                    continue
+                raise last_error
 
-        log_event(
-            self._logger,
-            level="info",
-            event="jito_bundle_submitted",
-            message="Atomic bundle submitted to Jito Block Engine",
-            plan_id=plan_id,
-            tx_count=len(signed_transactions),
-            tip_lamports=max(0, int(tip_lamports)),
-            bundle_id=bundle_id,
-        )
+            bundle_id = None
+            if isinstance(parsed, dict):
+                result = parsed.get("result")
+                if isinstance(result, str):
+                    bundle_id = result
+                elif isinstance(result, dict):
+                    bundle_id = str(result.get("bundleId") or result.get("id") or "") or None
 
-        return bundle_id
+            self._promote_endpoint(endpoint)
+            log_event(
+                self._logger,
+                level="info",
+                event="jito_bundle_submitted",
+                message="Atomic bundle submitted to Jito Block Engine",
+                plan_id=plan_id,
+                tx_count=len(signed_transactions),
+                tip_lamports=max(0, int(tip_lamports)),
+                bundle_id=bundle_id,
+                endpoint=_endpoint_for_log(endpoint),
+            )
+            return bundle_id
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Jito bundle submission failed: no endpoint available.")
 
 
 class AtomicExecutionCoordinator:
@@ -586,11 +909,13 @@ class AtomicExecutionCoordinator:
         fetch_signature_status: Callable[[str], Awaitable[dict[str, Any] | None]],
         ttl_seconds: int,
         limit: int,
+        stale_after_seconds: float | None = None,
     ) -> AtomicRecoverySummary:
         summary = await self.pending_manager.recover(
             fetch_signature_status=fetch_signature_status,
             ttl_seconds=ttl_seconds,
             limit=limit,
+            stale_after_seconds=stale_after_seconds,
         )
         if summary.scanned > 0:
             log_event(

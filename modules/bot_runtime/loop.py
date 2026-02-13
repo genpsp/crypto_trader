@@ -2,151 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 from collections import deque
-from typing import Any
 
 from modules.common import guarded_call, log_event
-from modules.storage import ConfigUpdateHandler, StorageGateway
+from modules.storage import StorageGateway
 from modules.trading import (
-    DryRunOrderExecutor,
-    HeliusQuoteWatcher,
     HeliusRateLimitError,
-    LiveAtomicArbExecutor,
-    LiveOrderExecutor,
     PairConfig,
     RuntimeConfig,
+    TransactionPendingConfirmationError,
     TraderEngine,
 )
 
+from .loop_helpers import (
+    bootstrap_dependencies,
+    check_and_recover_pending_guard,
+    compute_rate_limit_backoff_seconds,
+    drawdown_pct_from_peak,
+    estimate_execution_fee_lamports,
+    prepare_execution_result_metadata,
+    to_float,
+    try_resume_order_intake,
+    wait_with_stop,
+)
 from .settings import AppSettings
-
-
-def to_float(value: Any, default: float) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        return float(str(value).strip())
-    except (TypeError, ValueError):
-        return default
-
-
-def drawdown_pct_from_peak(*, current_lamports: int, peak_lamports: int) -> float:
-    if peak_lamports <= 0:
-        return 0.0
-    return max(0.0, ((peak_lamports - current_lamports) / peak_lamports) * 100.0)
-
-
-async def wait_with_stop(stop_event: asyncio.Event, timeout_seconds: float) -> None:
-    if timeout_seconds <= 0:
-        return
-
-    try:
-        await asyncio.wait_for(stop_event.wait(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        pass
-
-
-def estimate_execution_fee_lamports(
-    *,
-    priority_fee_micro_lamports: int,
-    priority_compute_units: int,
-    base_fee_lamports: int,
-    tip_lamports: int = 0,
-) -> int:
-    priority_fee_lamports = int((priority_fee_micro_lamports * priority_compute_units) / 1_000_000)
-    return max(0, priority_fee_lamports) + max(0, base_fee_lamports) + max(0, tip_lamports)
-
-
-async def bootstrap_dependencies(
-    *,
-    logger: logging.Logger,
-    stop_event: asyncio.Event,
-    app_settings: AppSettings,
-    storage: StorageGateway,
-    watcher: HeliusQuoteWatcher,
-    executor: DryRunOrderExecutor | LiveOrderExecutor | LiveAtomicArbExecutor,
-    config_listener_loop: asyncio.AbstractEventLoop,
-    on_config_update: ConfigUpdateHandler,
-) -> None:
-    while not stop_event.is_set():
-        try:
-            await storage.connect()
-            storage.start_config_listener(config_listener_loop, on_update=on_config_update)
-            await watcher.connect()
-            await executor.connect()
-            return
-        except Exception as error:
-            log_event(
-                logger,
-                level="exception",
-                event="bootstrap_error",
-                message="Dependency bootstrap failed",
-                error=str(error),
-            )
-            await guarded_call(
-                lambda: storage.publish_event(
-                    level="ERROR",
-                    event="bootstrap_error",
-                    message="Failed to initialize dependencies",
-                    details={"error": str(error)},
-                ),
-                logger=logger,
-                event="bootstrap_publish_error_failed",
-                message="Failed to publish bootstrap error",
-            )
-            await guarded_call(
-                watcher.close,
-                logger=logger,
-                event="bootstrap_watcher_close_failed",
-                message="Failed to close watcher during bootstrap retry",
-            )
-            await guarded_call(
-                executor.close,
-                logger=logger,
-                event="bootstrap_executor_close_failed",
-                message="Failed to close executor during bootstrap retry",
-            )
-            await guarded_call(
-                storage.close,
-                logger=logger,
-                event="bootstrap_storage_close_failed",
-                message="Failed to close storage during bootstrap retry",
-            )
-
-            await wait_with_stop(stop_event, app_settings.error_backoff_seconds)
-
-    raise RuntimeError("Shutdown requested before dependencies were initialized.")
-
-
-async def try_resume_order_intake(
-    *,
-    logger: logging.Logger,
-    storage: StorageGateway,
-    trader_engine: TraderEngine,
-    pause_reason: str,
-) -> bool:
-    try:
-        await storage.healthcheck()
-        await trader_engine.healthcheck()
-        log_event(
-            logger,
-            level="info",
-            event="order_intake_recovered",
-            message="Order intake resumed after dependency recovery",
-            reason=pause_reason,
-        )
-        return True
-    except Exception as error:
-        log_event(
-            logger,
-            level="warning",
-            event="order_intake_still_paused",
-            message="Order intake remains paused",
-            reason=pause_reason,
-            error=str(error),
-        )
-        return False
 
 
 async def run_trading_loop(
@@ -176,6 +55,7 @@ async def run_trading_loop(
     drawdown_circuit_open_until = 0.0
     peak_wallet_balance_lamports: int | None = None
     final_stop_active = False
+    next_pending_recovery_at = loop.time()
 
     async def open_execution_circuit(*, reason: str, error: str = "") -> None:
         nonlocal execution_circuit_open_until, consecutive_execution_errors
@@ -224,6 +104,13 @@ async def run_trading_loop(
         )
         consecutive_execution_errors = 0
 
+    def is_soft_execution_reject(error: Exception) -> bool:
+        error_text = str(error).lower()
+        return (
+            "custom program error: 0x1788" in error_text
+            or "insufficient funds" in error_text
+        )
+
     def refresh_recent_pnl(now_time: float) -> float:
         nonlocal recent_pnl_total
         window_seconds = app_settings.live_drawdown_window_seconds
@@ -236,13 +123,6 @@ async def run_trading_loop(
         nonlocal recent_pnl_total
         recent_pnl_deltas.append((now_time, pnl_delta_lamports))
         recent_pnl_total += pnl_delta_lamports
-
-    def compute_rate_limit_backoff_seconds(*, rate_limited_count: int) -> float:
-        if rate_limited_count <= 0:
-            return 0.0
-        base_seconds = min(30.0, float(2 ** max(0, rate_limited_count - 1)))
-        jitter_seconds = random.uniform(0.0, max(0.1, base_seconds * 0.25))
-        return min(30.0, base_seconds + jitter_seconds)
 
     async def open_drawdown_circuit(
         *,
@@ -492,6 +372,20 @@ async def run_trading_loop(
             redis_config = await storage.get_runtime_config()
             runtime_config = RuntimeConfig.from_redis(redis_config, runtime_defaults)
             priority_fee_plan = await trader_engine.resolve_priority_fee(runtime_config=runtime_config)
+
+            now_time = loop.time()
+            if not app_settings.dry_run and now_time >= next_pending_recovery_at:
+                recover_pending = getattr(trader_engine.executor, "recover_pending", None)
+                if callable(recover_pending):
+                    await guarded_call(
+                        recover_pending,
+                        logger=logger,
+                        event="pending_recovery_failed",
+                        message="Failed to recover pending live executions",
+                        level="warning",
+                    )
+                next_pending_recovery_at = now_time + app_settings.live_pending_recovery_interval_seconds
+
             decision = trader_engine.evaluate(
                 observation=observation,
                 runtime_config=runtime_config,
@@ -591,29 +485,14 @@ async def run_trading_loop(
 
                 estimated_fee_lamports = 0
                 if not app_settings.dry_run:
-                    if runtime_config.execution_mode == "atomic":
-                        pending_atomic_records = await storage.list_pending_atomic(
-                            statuses={"submitted", "pending_confirmation", "confirming"},
-                            limit=app_settings.live_max_pending_orders + 1,
-                        )
-                        pending_count = len(pending_atomic_records)
-                    else:
-                        pending_records = await storage.list_order_records(
-                            statuses={"pending", "submitted", "pending_confirmation", "confirming"},
-                            limit=app_settings.live_max_pending_orders + 1,
-                        )
-                        pending_count = len(pending_records)
-
-                    if pending_count >= app_settings.live_max_pending_orders:
-                        log_event(
-                            logger,
-                            level="warning",
-                            event="execution_pending_guard",
-                            message="Execution skipped due to pending order guard",
-                            pending_count=pending_count,
-                            max_pending_orders=app_settings.live_max_pending_orders,
-                            execution_mode=runtime_config.execution_mode,
-                        )
+                    pending_guard_active = await check_and_recover_pending_guard(
+                        logger=logger,
+                        storage=storage,
+                        trader_engine=trader_engine,
+                        runtime_config=runtime_config,
+                        app_settings=app_settings,
+                    )
+                    if pending_guard_active:
                         continue
 
                     tip_lamports = 0
@@ -660,7 +539,56 @@ async def run_trading_loop(
                         priority_fee_plan=priority_fee_plan,
                         idempotency_key=idempotency_key,
                     )
+                except TransactionPendingConfirmationError as error:
+                    pending_retry_after_seconds = max(
+                        app_settings.live_confirm_poll_interval_seconds,
+                        min(app_settings.live_pending_guard_ttl_seconds, app_settings.error_backoff_seconds),
+                    )
+                    transient_backoff_seconds = max(
+                        transient_backoff_seconds,
+                        pending_retry_after_seconds,
+                    )
+                    log_event(
+                        logger,
+                        level="warning",
+                        event="execution_pending_confirmation",
+                        message="Execution is pending confirmation; keeping intake active without incrementing error circuit",
+                        error=str(error),
+                        pending_retry_after_seconds=round(pending_retry_after_seconds, 3),
+                        consecutive_errors=consecutive_execution_errors,
+                    )
+                    await guarded_call(
+                        storage.update_heartbeat,
+                        logger=logger,
+                        event="execution_pending_confirmation_heartbeat_failed",
+                        message="Failed to update heartbeat during pending confirmation backoff",
+                    )
+                    continue
                 except Exception as error:
+                    if is_soft_execution_reject(error):
+                        log_event(
+                            logger,
+                            level="warning",
+                            event="execution_soft_reject",
+                            message=(
+                                "Execution simulation was rejected due to insufficient funds in swap legs; "
+                                "skipping without incrementing circuit breaker errors"
+                            ),
+                            error=str(error),
+                            consecutive_errors=consecutive_execution_errors,
+                        )
+                        transient_backoff_seconds = max(
+                            transient_backoff_seconds,
+                            app_settings.live_confirm_poll_interval_seconds,
+                        )
+                        await guarded_call(
+                            storage.update_heartbeat,
+                            logger=logger,
+                            event="execution_soft_reject_heartbeat_failed",
+                            message="Failed to update heartbeat after soft execution reject",
+                        )
+                        continue
+
                     consecutive_execution_errors += 1
                     log_event(
                         logger,
@@ -726,7 +654,10 @@ async def run_trading_loop(
                 else:
                     consecutive_execution_errors = 0
 
-                is_non_execution_result = result.status.startswith("skipped_") or result.status == "rate_limited"
+                is_non_execution_result = (
+                    result.status.startswith("skipped_")
+                    or result.status in {"rate_limited", "pending_confirmation"}
+                )
                 realized_pnl_lamports = to_float(result.metadata.get("pnl_delta"), 0.0)
                 if (
                     not app_settings.dry_run
@@ -735,6 +666,28 @@ async def run_trading_loop(
                     and estimated_fee_lamports > 0
                 ):
                     realized_pnl_lamports = -float(estimated_fee_lamports)
+                result_metadata, metrics_source, plan_expected_net_bps, requote_decay_bps = (
+                    prepare_execution_result_metadata(
+                        result_metadata=result.metadata if isinstance(result.metadata, dict) else None,
+                        initial_expected_net_bps=decision.expected_net_bps,
+                    )
+                )
+                if plan_expected_net_bps is not None:
+                    if (
+                        requote_decay_bps is not None
+                        and requote_decay_bps <= -app_settings.live_requote_decay_warn_bps
+                    ):
+                        log_event(
+                            logger,
+                            level="warning",
+                            event="requote_decay_detected",
+                            message="Re-quote edge degraded compared with initial decision",
+                            pair=pair.symbol,
+                            initial_expected_net_bps=round(decision.expected_net_bps, 6),
+                            plan_expected_net_bps=round(plan_expected_net_bps, 6),
+                            requote_decay_bps=round(requote_decay_bps, 6),
+                            plan_id=result_metadata.get("plan_id"),
+                        )
                 await storage.record_position(
                     {
                         "pair": pair.symbol,
@@ -759,8 +712,9 @@ async def run_trading_loop(
                         "total_fee_bps": decision.total_fee_bps,
                         "priority_fee_micro_lamports": result.priority_fee_micro_lamports,
                         "config_schema_version": runtime_config.config_schema_version,
+                        "metrics_source": metrics_source,
                         "pnl_delta": realized_pnl_lamports,
-                        "metadata": result.metadata,
+                        "metadata": result_metadata,
                     },
                     trade_id=result.order_id,
                 )
@@ -891,3 +845,9 @@ async def run_trading_loop(
                 delay_seconds = max(delay_seconds, transient_backoff_seconds)
 
             await wait_with_stop(stop_event, delay_seconds)
+
+
+__all__ = [
+    "bootstrap_dependencies",
+    "run_trading_loop",
+]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -13,6 +14,8 @@ from modules.common import log_event
 from .types import PairConfig, SpreadObservation, now_iso
 
 DEFAULT_JUPITER_QUOTE_ENDPOINT = "https://api.jup.ag/swap/v1/quote"
+_URL_QUERY_REDACTION_PATTERN = re.compile(r"(?i)(api[-_]?key=)[^&\s\"']+")
+_HEADER_REDACTION_PATTERN = re.compile(r"(?i)(x-api-key\s*[:=]\s*)([^\s,;\"']+)")
 
 
 class HeliusRateLimitError(RuntimeError):
@@ -163,6 +166,29 @@ def _quote_provider_from_endpoint(endpoint: str) -> str:
     return "quote"
 
 
+def _sanitize_endpoint_for_log(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+
+
+def _sanitize_preview_for_log(text: str, *, limit: int = 240) -> str:
+    if not text:
+        return ""
+    sanitized = _URL_QUERY_REDACTION_PATTERN.sub(r"\1***", text)
+    sanitized = _HEADER_REDACTION_PATTERN.sub(r"\1***", sanitized)
+    return sanitized[:limit]
+
+
+def _safe_forward_output_amount(quote: dict[str, Any]) -> int:
+    out_amount = int(quote.get("outAmount") or 0)
+    min_out_amount = int(quote.get("otherAmountThreshold") or 0)
+    if out_amount <= 0:
+        return 0
+    if min_out_amount <= 0:
+        return out_amount
+    return max(1, min(out_amount, min_out_amount))
+
+
 class HeliusQuoteWatcher:
     def __init__(
         self,
@@ -220,6 +246,15 @@ class HeliusQuoteWatcher:
             headers["x-api-key"] = self._api_key
         return headers
 
+    def _active_quote_endpoint_for_log(self) -> str:
+        return _sanitize_endpoint_for_log(self._quote_endpoint)
+
+    def _configured_api_base_for_log(self) -> str:
+        return _sanitize_endpoint_for_log(self._api_base_url)
+
+    def _quote_endpoints_for_log(self) -> list[str]:
+        return [_sanitize_endpoint_for_log(endpoint) for endpoint in self._quote_endpoints]
+
     def _build_headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
@@ -236,7 +271,7 @@ class HeliusQuoteWatcher:
                     level="warning",
                     event="quote_api_key_missing",
                     message="HELIUS_API_KEY is not set; quote requests may be rate-limited",
-                    quote_endpoint=self._quote_endpoint,
+                    quote_endpoint=self._active_quote_endpoint_for_log(),
                 )
         elif provider == "jupiter":
             if self._send_api_key_header and self._jupiter_api_key:
@@ -250,7 +285,7 @@ class HeliusQuoteWatcher:
                     message=(
                         "JUPITER_API_KEY is not set; fallback Jupiter endpoint may be strongly rate-limited."
                     ),
-                    quote_endpoint=self._quote_endpoint,
+                    quote_endpoint=self._active_quote_endpoint_for_log(),
                 )
         return headers
 
@@ -304,7 +339,7 @@ class HeliusQuoteWatcher:
                 message="Helius returned RPC error during connectivity probe",
                 status=status,
                 error=message,
-                body_preview=body[:240],
+                body_preview=_sanitize_preview_for_log(body),
             )
             raise RuntimeError(f"Helius connectivity check failed: {message}")
 
@@ -315,7 +350,7 @@ class HeliusQuoteWatcher:
                 event="helius_connectivity_auth_failed",
                 message="Helius API key is invalid or unauthorized",
                 status=status,
-                body_preview=body[:240],
+                body_preview=_sanitize_preview_for_log(body),
             )
             raise RuntimeError(
                 "Helius connectivity check failed: invalid API key or unauthorized access."
@@ -323,7 +358,8 @@ class HeliusQuoteWatcher:
 
         if status >= 400:
             raise RuntimeError(
-                f"Helius connectivity check failed: status={status} body={body[:240]!r}"
+                "Helius connectivity check failed: "
+                f"status={status} body={_sanitize_preview_for_log(body)!r}"
             )
 
     async def connect(self) -> None:
@@ -339,8 +375,8 @@ class HeliusQuoteWatcher:
                 event="quote_endpoint_failover_enabled",
                 message="Quote endpoint failover is enabled",
                 endpoint_total=len(self._quote_endpoints),
-                active_quote_endpoint=self._quote_endpoint,
-                quote_endpoints=self._quote_endpoints,
+                active_quote_endpoint=self._active_quote_endpoint_for_log(),
+                quote_endpoints=self._quote_endpoints_for_log(),
             )
 
         if (
@@ -356,8 +392,8 @@ class HeliusQuoteWatcher:
                 message=(
                     "Helius jup-proxy endpoint is disabled by configuration; quote requests start with Jupiter API."
                 ),
-                configured_url=self._api_base_url,
-                quote_endpoint=self._quote_endpoint,
+                configured_url=self._configured_api_base_for_log(),
+                quote_endpoint=self._active_quote_endpoint_for_log(),
             )
         elif (
             not self._fallback_quote_logged
@@ -372,8 +408,8 @@ class HeliusQuoteWatcher:
                 message=(
                     "HELIUS_QUOTE_API points to an RPC endpoint; quote requests will use Jupiter Quote API."
                 ),
-                configured_url=self._api_base_url,
-                quote_endpoint=self._quote_endpoint,
+                configured_url=self._configured_api_base_for_log(),
+                quote_endpoint=self._active_quote_endpoint_for_log(),
             )
 
         if not self._connectivity_checked:
@@ -399,11 +435,11 @@ class HeliusQuoteWatcher:
             event=event,
             message="Switching quote endpoint after runtime incompatibility",
             reason=reason,
-            previous_quote_endpoint=previous_endpoint,
-            next_quote_endpoint=self._quote_endpoint,
+            previous_quote_endpoint=_sanitize_endpoint_for_log(previous_endpoint),
+            next_quote_endpoint=self._active_quote_endpoint_for_log(),
             endpoint_index=self._quote_endpoint_index,
             endpoint_total=len(self._quote_endpoints),
-            body_preview=body_preview,
+            body_preview=_sanitize_preview_for_log(body_preview),
         )
         log_event(
             self._logger,
@@ -411,8 +447,8 @@ class HeliusQuoteWatcher:
             event="quote_endpoint_migrated",
             message="Quote endpoint migration completed",
             reason=reason,
-            previous_quote_endpoint=previous_endpoint,
-            next_quote_endpoint=self._quote_endpoint,
+            previous_quote_endpoint=_sanitize_endpoint_for_log(previous_endpoint),
+            next_quote_endpoint=self._active_quote_endpoint_for_log(),
             previous_provider=_quote_provider_from_endpoint(previous_endpoint),
             next_provider=_quote_provider_from_endpoint(self._quote_endpoint),
             endpoint_index=self._quote_endpoint_index,
@@ -436,6 +472,7 @@ class HeliusQuoteWatcher:
         output_mint: str,
         amount: int,
         slippage_bps: int,
+        extra_params: dict[str, str | int | bool] | None = None,
     ) -> dict[str, Any]:
         if self._session is None:
             await self.connect()
@@ -448,6 +485,12 @@ class HeliusQuoteWatcher:
             "amount": str(amount),
             "slippageBps": str(slippage_bps),
         }
+        if extra_params:
+            for key, value in extra_params.items():
+                normalized_key = str(key).strip()
+                if not normalized_key:
+                    continue
+                params[normalized_key] = str(value)
         last_error: Exception | None = None
         max_attempts = self._max_retries + 1
 
@@ -502,12 +545,12 @@ class HeliusQuoteWatcher:
                     status=status,
                     error=helius_error,
                     provider=provider,
-                    body_preview=body[:240],
+                    body_preview=_sanitize_preview_for_log(body),
                 )
                 if is_proxy_method_error and self._switch_quote_endpoint(
                     reason=helius_error,
                     event="helius_jup_proxy_unavailable",
-                    body_preview=body[:240],
+                    body_preview=body,
                 ):
                     continue
                 if "rate limit" in helius_error.lower():
@@ -519,7 +562,7 @@ class HeliusQuoteWatcher:
                 raise RuntimeError(f"Quote API error ({provider}): {helius_error}")
 
             if status == 429:
-                body_preview = body[:300]
+                body_preview = _sanitize_preview_for_log(body, limit=300)
                 rate_limit_backoff = self._rate_limit_backoff_seconds
                 if provider == "jupiter" and not self._jupiter_api_key:
                     rate_limit_backoff = max(rate_limit_backoff, 30.0)
@@ -545,13 +588,13 @@ class HeliusQuoteWatcher:
                     max_attempts=max_attempts,
                     status=status,
                     retry_after_seconds=sleep_seconds,
-                    body_preview=body[:200],
+                    body_preview=_sanitize_preview_for_log(body, limit=200),
                 )
                 await asyncio.sleep(sleep_seconds)
                 continue
 
             if status >= 400:
-                body_preview = body[:300]
+                body_preview = _sanitize_preview_for_log(body, limit=300)
                 if status == 404 and _is_helius_jup_proxy_path(urlsplit(self._quote_endpoint).path):
                     if self._switch_quote_endpoint(
                         reason="status=404",
@@ -581,12 +624,13 @@ class HeliusQuoteWatcher:
                         max_attempts=max_attempts,
                         status=status,
                         error=str(parse_error),
-                        body_preview=body[:200],
+                        body_preview=_sanitize_preview_for_log(body, limit=200),
                     )
                     await asyncio.sleep(self._retry_backoff_seconds * attempt)
                     continue
                 raise RuntimeError(
-                    f"Quote endpoint returned non-JSON response: status={status} body={body[:300]!r}"
+                    "Quote endpoint returned non-JSON response: "
+                    f"status={status} body={_sanitize_preview_for_log(body, limit=300)!r}"
                 ) from parse_error
 
             if "outAmount" not in data:
@@ -604,11 +648,14 @@ class HeliusQuoteWatcher:
             slippage_bps=pair.slippage_bps,
         )
         forward_out = int(forward_quote["outAmount"])
+        reusable_forward_out = _safe_forward_output_amount(forward_quote)
+        if reusable_forward_out <= 0:
+            raise RuntimeError("Forward quote did not provide a valid reusable output amount.")
 
         reverse_quote = await self.quote(
             input_mint=pair.quote_mint,
             output_mint=pair.base_mint,
-            amount=forward_out,
+            amount=reusable_forward_out,
             slippage_bps=pair.slippage_bps,
         )
         reverse_out = int(reverse_quote["outAmount"])
@@ -622,7 +669,7 @@ class HeliusQuoteWatcher:
         return SpreadObservation(
             pair=pair.symbol,
             timestamp=now_iso(),
-            forward_out_amount=forward_out,
+            forward_out_amount=reusable_forward_out,
             reverse_out_amount=reverse_out,
             forward_price=forward_price,
             spread_bps=spread_bps,

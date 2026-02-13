@@ -32,9 +32,12 @@ class AtomicTransactionBuilder:
         *,
         plan: AtomicExecutionPlan,
         build_leg_tx: Callable[[dict[str, Any], int], Awaitable[dict[str, Any]]],
+        build_single_tx: Callable[[AtomicExecutionPlan], Awaitable[AtomicBuildArtifact]] | None = None,
     ) -> AtomicBuildArtifact:
         if plan.resolved_mode == "single_tx":
             try:
+                if build_single_tx is not None:
+                    return await build_single_tx(plan)
                 return await self._build_single_tx(plan=plan)
             except AtomicBuildUnavailableError as error:
                 if plan.send_mode != "auto":

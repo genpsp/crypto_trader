@@ -1,5 +1,10 @@
 from .engine import TraderEngine
-from .executors import DryRunOrderExecutor, LiveAtomicArbExecutor, LiveOrderExecutor
+from .executors import (
+    DryRunOrderExecutor,
+    LiveAtomicArbExecutor,
+    LiveOrderExecutor,
+    TransactionPendingConfirmationError,
+)
 from .atomic import JitoBundleRateLimitError
 from .watcher import HeliusQuoteWatcher, HeliusRateLimitError
 from .types import PairConfig, RuntimeConfig
@@ -14,4 +19,5 @@ __all__ = [
     "PairConfig",
     "RuntimeConfig",
     "TraderEngine",
+    "TransactionPendingConfirmationError",
 ]

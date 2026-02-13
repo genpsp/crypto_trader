@@ -35,6 +35,16 @@ def lamports_to_bps(*, lamports: int, notional_lamports: int) -> float:
     return (max(0, lamports) / notional_lamports) * 10_000
 
 
+def safe_forward_output_amount(quote: dict[str, Any]) -> int:
+    out_amount = to_int(quote.get("outAmount"), 0)
+    min_out_amount = to_int(quote.get("otherAmountThreshold"), 0)
+    if out_amount <= 0:
+        return 0
+    if min_out_amount <= 0:
+        return out_amount
+    return max(1, min(out_amount, min_out_amount))
+
+
 class AtomicPlanner:
     async def refresh_observation(
         self,
@@ -51,11 +61,14 @@ class AtomicPlanner:
         forward_out = to_int(forward_quote.get("outAmount"), 0)
         if forward_out <= 0:
             raise RuntimeError("Atomic planner failed: forward quote outAmount is missing or invalid.")
+        reusable_forward_out = safe_forward_output_amount(forward_quote)
+        if reusable_forward_out <= 0:
+            raise RuntimeError("Atomic planner failed: reusable forward amount is invalid.")
 
         reverse_quote = await quote_callable(
             input_mint=pair.quote_mint,
             output_mint=pair.base_mint,
-            amount=forward_out,
+            amount=reusable_forward_out,
             slippage_bps=pair.slippage_bps,
         )
         reverse_out = to_int(reverse_quote.get("outAmount"), 0)
@@ -71,7 +84,7 @@ class AtomicPlanner:
         return SpreadObservation(
             pair=pair.symbol,
             timestamp=now_iso(),
-            forward_out_amount=forward_out,
+            forward_out_amount=reusable_forward_out,
             reverse_out_amount=reverse_out,
             forward_price=forward_price,
             spread_bps=spread_bps,

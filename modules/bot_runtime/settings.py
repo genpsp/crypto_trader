@@ -71,6 +71,7 @@ class AppSettings:
     live_rebuild_max_attempts: int
     live_pending_guard_ttl_seconds: int
     live_pending_recovery_limit: int
+    live_pending_recovery_interval_seconds: float
     live_execution_cooldown_seconds: float
     live_execution_window_seconds: float
     live_max_executions_per_window: int
@@ -86,6 +87,7 @@ class AppSettings:
     live_max_drawdown_pct: float
     live_final_stop_equity_usd: float
     live_drawdown_circuit_breaker_seconds: float
+    live_requote_decay_warn_bps: float
 
     @classmethod
     def from_env(cls) -> "AppSettings":
@@ -124,7 +126,7 @@ class AppSettings:
             ),
             live_confirm_poll_interval_seconds=max(
                 0.25,
-                to_float(os.getenv("LIVE_CONFIRM_POLL_INTERVAL_SECONDS"), 1.0),
+                to_float(os.getenv("LIVE_CONFIRM_POLL_INTERVAL_SECONDS"), 0.5),
             ),
             live_rebuild_max_attempts=max(1, to_int(os.getenv("LIVE_REBUILD_MAX_ATTEMPTS"), 2)),
             live_pending_guard_ttl_seconds=max(
@@ -132,6 +134,10 @@ class AppSettings:
                 to_int(os.getenv("LIVE_PENDING_GUARD_TTL_SECONDS"), 180),
             ),
             live_pending_recovery_limit=max(1, to_int(os.getenv("LIVE_PENDING_RECOVERY_LIMIT"), 50)),
+            live_pending_recovery_interval_seconds=max(
+                1.0,
+                to_float(os.getenv("LIVE_PENDING_RECOVERY_INTERVAL_SECONDS"), 5.0),
+            ),
             live_execution_cooldown_seconds=max(
                 0.0,
                 to_float(os.getenv("LIVE_EXECUTION_COOLDOWN_SECONDS"), 5.0),
@@ -185,5 +191,9 @@ class AppSettings:
             live_drawdown_circuit_breaker_seconds=max(
                 1.0,
                 to_float(os.getenv("LIVE_DRAWDOWN_CIRCUIT_BREAKER_SECONDS"), 900.0),
+            ),
+            live_requote_decay_warn_bps=max(
+                0.0,
+                to_float(os.getenv("LIVE_REQUOTE_DECAY_WARN_BPS"), 1.0),
             ),
         )
