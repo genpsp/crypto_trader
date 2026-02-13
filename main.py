@@ -15,6 +15,7 @@ from modules.storage import StorageGateway, StorageSettings
 from modules.trading import (
     DryRunOrderExecutor,
     HeliusQuoteWatcher,
+    LiveAtomicArbExecutor,
     LiveOrderExecutor,
     PairConfig,
     RuntimeConfig,
@@ -37,29 +38,55 @@ async def main() -> None:
         api_base_url=app_settings.helius_quote_api,
         api_key=app_settings.helius_api_key or None,
         jupiter_api_key=app_settings.jupiter_api_key or None,
+        enable_helius_jup_proxy=app_settings.helius_jup_proxy_enabled,
     )
     if app_settings.dry_run:
-        executor: DryRunOrderExecutor | LiveOrderExecutor = DryRunOrderExecutor(
+        executor: DryRunOrderExecutor | LiveOrderExecutor | LiveAtomicArbExecutor = DryRunOrderExecutor(
             logger=logger,
             order_store=storage,
         )
     else:
-        executor = LiveOrderExecutor(
-            logger=logger,
-            rpc_url=app_settings.solana_rpc_url,
-            private_key=app_settings.private_key,
-            order_store=storage,
-            swap_api_url=app_settings.jupiter_swap_api,
-            jupiter_api_key=app_settings.jupiter_api_key or None,
-            send_max_attempts=app_settings.live_send_max_attempts,
-            send_retry_backoff_seconds=app_settings.live_send_retry_backoff_seconds,
-            confirm_timeout_seconds=app_settings.live_confirm_timeout_seconds,
-            confirm_poll_interval_seconds=app_settings.live_confirm_poll_interval_seconds,
-            rebuild_max_attempts=app_settings.live_rebuild_max_attempts,
-            pending_guard_ttl_seconds=app_settings.live_pending_guard_ttl_seconds,
-            pending_recovery_limit=app_settings.live_pending_recovery_limit,
-            min_balance_lamports=app_settings.live_min_balance_lamports,
-        )
+        if app_settings.execution_mode == "atomic":
+            executor = LiveAtomicArbExecutor(
+                logger=logger,
+                rpc_url=app_settings.solana_rpc_url,
+                private_key=app_settings.private_key,
+                watcher=watcher,
+                order_store=storage,
+                swap_api_url=app_settings.jupiter_swap_api,
+                jupiter_api_key=app_settings.jupiter_api_key or None,
+                send_max_attempts=app_settings.live_send_max_attempts,
+                send_retry_backoff_seconds=app_settings.live_send_retry_backoff_seconds,
+                confirm_timeout_seconds=app_settings.live_confirm_timeout_seconds,
+                confirm_poll_interval_seconds=app_settings.live_confirm_poll_interval_seconds,
+                rebuild_max_attempts=app_settings.live_rebuild_max_attempts,
+                pending_guard_ttl_seconds=app_settings.live_pending_guard_ttl_seconds,
+                pending_recovery_limit=app_settings.live_pending_recovery_limit,
+                min_balance_lamports=app_settings.live_min_balance_lamports,
+                atomic_send_mode=app_settings.atomic_send_mode,
+                atomic_expiry_ms=app_settings.atomic_expiry_ms,
+                atomic_margin_bps=app_settings.atomic_margin_bps,
+                jito_block_engine_url=app_settings.jito_block_engine_url,
+                jito_tip_lamports_max=app_settings.jito_tip_lamports_max,
+                jito_tip_lamports_recommended=app_settings.jito_tip_lamports_recommended,
+            )
+        else:
+            executor = LiveOrderExecutor(
+                logger=logger,
+                rpc_url=app_settings.solana_rpc_url,
+                private_key=app_settings.private_key,
+                order_store=storage,
+                swap_api_url=app_settings.jupiter_swap_api,
+                jupiter_api_key=app_settings.jupiter_api_key or None,
+                send_max_attempts=app_settings.live_send_max_attempts,
+                send_retry_backoff_seconds=app_settings.live_send_retry_backoff_seconds,
+                confirm_timeout_seconds=app_settings.live_confirm_timeout_seconds,
+                confirm_poll_interval_seconds=app_settings.live_confirm_poll_interval_seconds,
+                rebuild_max_attempts=app_settings.live_rebuild_max_attempts,
+                pending_guard_ttl_seconds=app_settings.live_pending_guard_ttl_seconds,
+                pending_recovery_limit=app_settings.live_pending_recovery_limit,
+                min_balance_lamports=app_settings.live_min_balance_lamports,
+            )
 
     trader_engine = TraderEngine(logger=logger, watcher=watcher, executor=executor)
 
@@ -108,6 +135,7 @@ async def main() -> None:
             "pair": pair.symbol,
             "dry_run": app_settings.dry_run,
             "watch_interval_seconds": app_settings.watch_interval_seconds,
+            "execution_mode": app_settings.execution_mode,
         },
         event_id=f"bot_started:{storage.run_id}",
     )

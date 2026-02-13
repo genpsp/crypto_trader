@@ -59,6 +59,20 @@ def percentile_value(values: list[int], percentile: float) -> int:
     return sorted_values[index]
 
 
+def normalize_execution_mode(value: str) -> str:
+    mode = (value or "").strip().lower()
+    if mode in {"atomic", "legacy"}:
+        return mode
+    return "atomic"
+
+
+def normalize_atomic_send_mode(value: str) -> str:
+    mode = (value or "").strip().lower()
+    if mode in {"single_tx", "bundle", "auto"}:
+        return mode
+    return "auto"
+
+
 def make_order_id(idempotency_key: str, blockhash: str | None = None) -> str:
     tail = blockhash[:16] if blockhash else datetime.now(timezone.utc).strftime("%H%M%S%f")
     return f"ord-{idempotency_key[:18]}-{tail}"
@@ -111,6 +125,14 @@ class RuntimeConfig:
     max_fee_micro_lamports: int
     trade_enabled: bool
     order_guard_ttl_seconds: int
+    execution_mode: str
+    atomic_send_mode: str
+    atomic_expiry_ms: int
+    atomic_margin_bps: float
+    atomic_bundle_min_expected_net_bps: float
+    jito_block_engine_url: str
+    jito_tip_lamports_max: int
+    jito_tip_lamports_recommended: int
 
     @classmethod
     def from_env_defaults(cls) -> "RuntimeConfig":
@@ -125,6 +147,20 @@ class RuntimeConfig:
             max_fee_micro_lamports=to_int(os.getenv("MAX_FEE_MICRO_LAMPORTS"), 80_000),
             trade_enabled=to_bool(os.getenv("TRADE_ENABLED"), False),
             order_guard_ttl_seconds=max(1, to_int(os.getenv("ORDER_GUARD_TTL_SECONDS"), 20)),
+            execution_mode=normalize_execution_mode(os.getenv("EXECUTION_MODE", "atomic")),
+            atomic_send_mode=normalize_atomic_send_mode(os.getenv("ATOMIC_SEND_MODE", "auto")),
+            atomic_expiry_ms=max(250, to_int(os.getenv("ATOMIC_EXPIRY_MS"), 5_000)),
+            atomic_margin_bps=max(0.0, to_float(os.getenv("ATOMIC_MARGIN_BPS"), 20.0)),
+            atomic_bundle_min_expected_net_bps=max(
+                0.0,
+                to_float(os.getenv("ATOMIC_BUNDLE_MIN_EXPECTED_NET_BPS"), 2.0),
+            ),
+            jito_block_engine_url=os.getenv("JITO_BLOCK_ENGINE_URL", "").strip(),
+            jito_tip_lamports_max=max(0, to_int(os.getenv("JITO_TIP_LAMPORTS_MAX"), 100_000)),
+            jito_tip_lamports_recommended=max(
+                0,
+                to_int(os.getenv("JITO_TIP_LAMPORTS_RECOMMENDED"), 20_000),
+            ),
         )
 
     @classmethod
@@ -133,10 +169,7 @@ class RuntimeConfig:
         max_fee_raw = redis_config.get("max_fee_micro_lamports") or redis_config.get("max_fee")
 
         return cls(
-            config_schema_version=max(
-                1,
-                to_int(schema_raw, defaults.config_schema_version),
-            ),
+            config_schema_version=max(1, to_int(schema_raw, defaults.config_schema_version)),
             min_spread_bps=to_float(
                 redis_config.get("min_spread_bps") or redis_config.get("min_spread"),
                 defaults.min_spread_bps,
@@ -161,9 +194,43 @@ class RuntimeConfig:
             trade_enabled=to_bool(redis_config.get("trade_enabled"), defaults.trade_enabled),
             order_guard_ttl_seconds=max(
                 1,
+                to_int(redis_config.get("order_guard_ttl_seconds"), defaults.order_guard_ttl_seconds),
+            ),
+            execution_mode=normalize_execution_mode(
+                redis_config.get("execution_mode") or defaults.execution_mode
+            ),
+            atomic_send_mode=normalize_atomic_send_mode(
+                redis_config.get("atomic_send_mode") or defaults.atomic_send_mode
+            ),
+            atomic_expiry_ms=max(
+                250,
+                to_int(redis_config.get("atomic_expiry_ms"), defaults.atomic_expiry_ms),
+            ),
+            atomic_margin_bps=max(
+                0.0,
+                to_float(redis_config.get("atomic_margin_bps"), defaults.atomic_margin_bps),
+            ),
+            atomic_bundle_min_expected_net_bps=max(
+                0.0,
+                to_float(
+                    redis_config.get("atomic_bundle_min_expected_net_bps"),
+                    defaults.atomic_bundle_min_expected_net_bps,
+                ),
+            ),
+            jito_block_engine_url=(
+                redis_config.get("jito_block_engine_url")
+                or redis_config.get("JITO_BLOCK_ENGINE_URL")
+                or defaults.jito_block_engine_url
+            ).strip(),
+            jito_tip_lamports_max=max(
+                0,
+                to_int(redis_config.get("jito_tip_lamports_max"), defaults.jito_tip_lamports_max),
+            ),
+            jito_tip_lamports_recommended=max(
+                0,
                 to_int(
-                    redis_config.get("order_guard_ttl_seconds"),
-                    defaults.order_guard_ttl_seconds,
+                    redis_config.get("jito_tip_lamports_recommended"),
+                    defaults.jito_tip_lamports_recommended,
                 ),
             ),
         )
@@ -192,6 +259,9 @@ class TradeDecision:
     reason: str
     blocked_by_fee_cap: bool
     priority_fee_micro_lamports: int
+    tip_lamports: int
+    atomic_margin_bps: float
+    expected_net_bps: float
 
 
 @dataclass(slots=True, frozen=True)
@@ -266,6 +336,44 @@ class OrderGuardStore(Protocol):
     ) -> list[dict[str, Any]]:
         ...
 
+    async def save_pending_atomic(
+        self,
+        *,
+        plan_id: str,
+        status: str,
+        order_id: str,
+        guard_key: str,
+        tx_signatures: list[str],
+        ttl_seconds: int,
+        mode: str,
+        bundle_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        ...
+
+    async def update_pending_atomic(
+        self,
+        *,
+        plan_id: str,
+        status: str,
+        ttl_seconds: int,
+        tx_signatures: list[str] | None = None,
+        bundle_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        ...
+
+    async def list_pending_atomic(
+        self,
+        *,
+        statuses: set[str] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        ...
+
+    async def delete_pending_atomic(self, *, plan_id: str) -> bool:
+        ...
+
 
 class OrderExecutor(Protocol):
     async def connect(self) -> None:
@@ -280,6 +388,9 @@ class OrderExecutor(Protocol):
     async def resolve_priority_fee(self, *, runtime_config: RuntimeConfig) -> PriorityFeePlan:
         ...
 
+    async def get_wallet_balance_lamports(self) -> int | None:
+        ...
+
     async def execute(
         self,
         *,
@@ -287,6 +398,7 @@ class OrderExecutor(Protocol):
         idempotency_key: str,
         lock_ttl_seconds: int,
         priority_fee_micro_lamports: int,
+        runtime_config: RuntimeConfig,
         metadata: dict[str, Any] | None = None,
     ) -> ExecutionResult:
         ...

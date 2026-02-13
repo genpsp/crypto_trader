@@ -44,7 +44,7 @@ class StorageGateway(FirestoreStorageOps, RedisStorageOps):
 
     @property
     def bot_id(self) -> str:
-        return self.settings.bot_id
+        return self.settings.firestore_results_bot_id
 
     @property
     def run_id(self) -> str:
@@ -83,6 +83,16 @@ class StorageGateway(FirestoreStorageOps, RedisStorageOps):
             )
 
         self._initialize_namespace_refs()
+        if self.settings.firestore_results_bot_id != self.settings.bot_id:
+            log_event(
+                self._logger,
+                level="info",
+                event="firestore_result_namespace_split",
+                message="Dry-run Firestore result namespace is enabled",
+                source_bot_id=self.settings.bot_id,
+                results_bot_id=self.settings.firestore_results_bot_id,
+                split_enabled=self.settings.firestore_split_dry_run_results,
+            )
         await self._ensure_bot_namespace()
 
         self._config_doc_ref = self._firestore.document(self._resolved_firestore_config_doc)
