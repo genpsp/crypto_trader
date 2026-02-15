@@ -76,6 +76,92 @@ def _endpoint_for_log(endpoint: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
+def _to_int(value: Any) -> int | None:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed
+
+
+def _extract_bundle_status_entry(parsed: Any, *, bundle_id: str) -> dict[str, Any] | None:
+    if not isinstance(parsed, dict):
+        return None
+
+    result = parsed.get("result")
+    entries: list[dict[str, Any]] = []
+
+    if isinstance(result, dict):
+        for key in ("value", "bundles", "statuses"):
+            candidate = result.get(key)
+            if isinstance(candidate, list):
+                entries.extend(item for item in candidate if isinstance(item, dict))
+        if not entries:
+            entries.append(result)
+    elif isinstance(result, list):
+        entries.extend(item for item in result if isinstance(item, dict))
+
+    if not entries:
+        return None
+
+    normalized_bundle_id = str(bundle_id or "").strip()
+    selected: dict[str, Any] | None = None
+    for entry in entries:
+        entry_bundle_id = str(
+            entry.get("bundle_id")
+            or entry.get("bundleId")
+            or entry.get("id")
+            or ""
+        ).strip()
+        if normalized_bundle_id and entry_bundle_id == normalized_bundle_id:
+            selected = entry
+            break
+        if selected is None:
+            selected = entry
+
+    if selected is None:
+        return None
+
+    status = str(
+        selected.get("status")
+        or selected.get("state")
+        or selected.get("result")
+        or ""
+    ).strip()
+    landed_slot = _to_int(
+        selected.get("landed_slot")
+        or selected.get("landedSlot")
+        or selected.get("slot")
+    )
+    signatures_raw = (
+        selected.get("signatures")
+        or selected.get("transactions")
+        or selected.get("tx_signatures")
+        or []
+    )
+    signatures: list[str] = []
+    if isinstance(signatures_raw, list):
+        for signature in signatures_raw:
+            normalized = str(signature or "").strip()
+            if normalized:
+                signatures.append(normalized)
+
+    return {
+        "bundle_id": str(
+            selected.get("bundle_id")
+            or selected.get("bundleId")
+            or selected.get("id")
+            or normalized_bundle_id
+        ).strip()
+        or normalized_bundle_id,
+        "status": status,
+        "landed_slot": landed_slot,
+        "err": selected.get("err") if "err" in selected else selected.get("error"),
+        "signatures": signatures,
+        "raw": selected,
+    }
+
+
 class AtomicPendingStore(Protocol):
     async def save_pending_atomic(
         self,
@@ -876,6 +962,155 @@ class JitoBlockEngineClient:
             raise last_error
         raise RuntimeError("Jito bundle submission failed: no endpoint available.")
 
+    async def fetch_bundle_status(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        bundle_id: str,
+        plan_id: str,
+    ) -> dict[str, Any] | None:
+        endpoints = self._iter_endpoints()
+        normalized_bundle_id = str(bundle_id or "").strip()
+        if not endpoints or not normalized_bundle_id:
+            return None
+
+        methods = ("getInflightBundleStatuses", "getBundleStatuses")
+        last_error: Exception | None = None
+
+        for method in methods:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": [[normalized_bundle_id]],
+            }
+            for idx, endpoint in enumerate(endpoints, start=1):
+                try:
+                    async with session.post(endpoint, json=payload) as response:
+                        status = response.status
+                        retry_after_seconds = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+                        raw_text = await response.text()
+                except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                    last_error = RuntimeError(f"Jito {method} request failed: {error}")
+                    if idx < len(endpoints):
+                        self._log_failover(
+                            event="jito_bundle_status_endpoint_failover",
+                            message="Switching Jito endpoint after bundle-status transport failure",
+                            from_endpoint=endpoint,
+                            to_endpoint=endpoints[idx],
+                            error=str(error),
+                        )
+                        continue
+                    break
+
+                parsed: Any = None
+                try:
+                    parsed = json.loads(raw_text) if raw_text else {}
+                except json.JSONDecodeError:
+                    parsed = {"raw": raw_text}
+
+                if status == 429:
+                    rate_error = JitoBundleRateLimitError(
+                        f"Jito {method} failed: status={status} body={str(raw_text)[:240]!r}",
+                        retry_after_seconds=retry_after_seconds,
+                    )
+                    last_error = rate_error
+                    if idx < len(endpoints):
+                        self._log_failover(
+                            event="jito_bundle_status_endpoint_failover",
+                            message="Switching Jito endpoint after bundle-status rate limit",
+                            from_endpoint=endpoint,
+                            to_endpoint=endpoints[idx],
+                            error=str(rate_error),
+                        )
+                        continue
+                    raise rate_error
+
+                if status >= 400:
+                    error_message = str(raw_text)
+                    if isinstance(parsed, dict) and parsed.get("error") is not None:
+                        error_message = _error_message_from_payload(parsed.get("error"))
+                    if _is_jito_rate_limit_message(error_message):
+                        rate_error = JitoBundleRateLimitError(
+                            f"Jito {method} rate-limited: status={status} error={error_message}",
+                            retry_after_seconds=retry_after_seconds,
+                        )
+                        last_error = rate_error
+                        if idx < len(endpoints):
+                            self._log_failover(
+                                event="jito_bundle_status_endpoint_failover",
+                                message="Switching Jito endpoint after bundle-status rate limit",
+                                from_endpoint=endpoint,
+                                to_endpoint=endpoints[idx],
+                                error=str(rate_error),
+                            )
+                            continue
+                        raise rate_error
+                    last_error = RuntimeError(
+                        f"Jito {method} failed: status={status} body={str(raw_text)[:240]!r}"
+                    )
+                    if idx < len(endpoints):
+                        self._log_failover(
+                            event="jito_bundle_status_endpoint_failover",
+                            message="Switching Jito endpoint after bundle-status response error",
+                            from_endpoint=endpoint,
+                            to_endpoint=endpoints[idx],
+                            error=str(last_error),
+                        )
+                        continue
+                    break
+
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    error_payload = parsed["error"]
+                    error_message = _error_message_from_payload(error_payload)
+                    if _is_jito_rate_limit_message(error_message):
+                        rate_error = JitoBundleRateLimitError(
+                            f"Jito {method} rate-limited: {error_message}",
+                            retry_after_seconds=retry_after_seconds,
+                        )
+                        last_error = rate_error
+                        if idx < len(endpoints):
+                            self._log_failover(
+                                event="jito_bundle_status_endpoint_failover",
+                                message="Switching Jito endpoint after bundle-status RPC rate limit",
+                                from_endpoint=endpoint,
+                                to_endpoint=endpoints[idx],
+                                error=str(rate_error),
+                            )
+                            continue
+                        raise rate_error
+                    last_error = RuntimeError(f"Jito {method} failed: {error_payload}")
+                    if idx < len(endpoints):
+                        self._log_failover(
+                            event="jito_bundle_status_endpoint_failover",
+                            message="Switching Jito endpoint after bundle-status RPC error",
+                            from_endpoint=endpoint,
+                            to_endpoint=endpoints[idx],
+                            error=str(last_error),
+                        )
+                        continue
+                    break
+
+                entry = _extract_bundle_status_entry(parsed, bundle_id=normalized_bundle_id)
+                if entry is not None:
+                    entry["method"] = method
+                    entry["endpoint"] = _endpoint_for_log(endpoint)
+                    entry["plan_id"] = plan_id
+                    self._promote_endpoint(endpoint)
+                    return entry
+
+        if last_error is not None:
+            log_event(
+                self._logger,
+                level="warning",
+                event="jito_bundle_status_fetch_failed",
+                message="Failed to fetch Jito bundle status after submission",
+                plan_id=plan_id,
+                bundle_id=normalized_bundle_id,
+                error=str(last_error),
+            )
+        return None
+
 
 class AtomicExecutionCoordinator:
     def __init__(
@@ -895,12 +1130,26 @@ class AtomicExecutionCoordinator:
         session: aiohttp.ClientSession,
         plan: AtomicExecutionPlan,
         signed_transactions: list[str],
+        tip_lamports: int,
     ) -> str | None:
         return await self.jito_client.send_bundle(
             session=session,
             signed_transactions=signed_transactions,
-            tip_lamports=plan.tip_lamports,
+            tip_lamports=tip_lamports,
             plan_id=plan.plan_id,
+        )
+
+    async def fetch_bundle_status(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        plan_id: str,
+        bundle_id: str,
+    ) -> dict[str, Any] | None:
+        return await self.jito_client.fetch_bundle_status(
+            session=session,
+            bundle_id=bundle_id,
+            plan_id=plan_id,
         )
 
     async def recover_pending(

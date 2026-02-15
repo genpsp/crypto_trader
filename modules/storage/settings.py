@@ -71,6 +71,10 @@ class StorageSettings:
     order_guard_prefix: str
     order_record_prefix: str
     pending_atomic_prefix: str
+    runtime_counter_key: str
+    runtime_summary_key: str
+    rate_limit_pause_key: str
+    runtime_metrics_ttl_seconds: int
 
     @classmethod
     def from_env(cls) -> "StorageSettings":
@@ -135,4 +139,11 @@ class StorageSettings:
             order_guard_prefix=os.getenv("REDIS_ORDER_GUARD_PREFIX", "orders:guard"),
             order_record_prefix=os.getenv("REDIS_ORDER_RECORD_PREFIX", "orders:record"),
             pending_atomic_prefix=os.getenv("REDIS_PENDING_ATOMIC_PREFIX", "pending_atomic"),
+            runtime_counter_key=os.getenv("REDIS_RUNTIME_COUNTER_KEY", "metrics:runtime:counters"),
+            runtime_summary_key=os.getenv("REDIS_RUNTIME_SUMMARY_KEY", "metrics:runtime:summary"),
+            rate_limit_pause_key=os.getenv("REDIS_RATE_LIMIT_PAUSE_KEY", "bot:rate_limit_pause_until"),
+            runtime_metrics_ttl_seconds=max(
+                0,
+                to_int(os.getenv("REDIS_RUNTIME_METRICS_TTL_SECONDS"), 172800),
+            ),
         )

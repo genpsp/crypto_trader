@@ -45,6 +45,13 @@ def normalize_atomic_send_mode(value: str) -> str:
     return "auto"
 
 
+def normalize_env_config_priority(value: str) -> str:
+    mode = (value or "").strip().lower()
+    if mode in {"env", "firestore"}:
+        return mode
+    return "firestore"
+
+
 @dataclass(slots=True)
 class AppSettings:
     watch_interval_seconds: float
@@ -53,6 +60,9 @@ class AppSettings:
     helius_api_key: str
     jupiter_api_key: str
     helius_jup_proxy_enabled: bool
+    quote_default_params_json: str
+    quote_initial_params_json: str
+    quote_plan_params_json: str
     jupiter_swap_api: str
     solana_rpc_url: str
     private_key: str
@@ -88,6 +98,18 @@ class AppSettings:
     live_final_stop_equity_usd: float
     live_drawdown_circuit_breaker_seconds: float
     live_requote_decay_warn_bps: float
+    live_initial_requote_gate_bps: float
+    live_requote_decay_guard_trigger_bps: float
+    live_requote_decay_guard_pause_seconds: float
+    live_requote_decay_guard_required_net_bps_boost: float
+    live_single_tx_compact_requote_max_strategies: int
+    live_initial_breakdown_log_interval_seconds: float
+    live_edge_summary_window_seconds: float
+    live_edge_summary_interval_seconds: float
+    live_edge_no_edge_window_seconds: float
+    live_edge_consider_stop_window_seconds: float
+    live_edge_consider_stop_pass_rate_pct: float
+    env_config_priority: str
 
     @classmethod
     def from_env(cls) -> "AppSettings":
@@ -101,6 +123,9 @@ class AppSettings:
             helius_api_key=os.getenv("HELIUS_API_KEY", "").strip(),
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip(),
             helius_jup_proxy_enabled=to_bool(os.getenv("HELIUS_JUP_PROXY_ENABLED"), False),
+            quote_default_params_json=os.getenv("QUOTE_DEFAULT_PARAMS_JSON", "").strip(),
+            quote_initial_params_json=os.getenv("QUOTE_INITIAL_PARAMS_JSON", "").strip(),
+            quote_plan_params_json=os.getenv("QUOTE_PLAN_PARAMS_JSON", "").strip(),
             jupiter_swap_api=os.getenv("JUPITER_SWAP_API", "https://api.jup.ag/swap/v1/swap").strip(),
             solana_rpc_url=os.getenv("SOLANA_RPC_URL", "").strip(),
             private_key=os.getenv("PRIVATE_KEY", ""),
@@ -195,5 +220,52 @@ class AppSettings:
             live_requote_decay_warn_bps=max(
                 0.0,
                 to_float(os.getenv("LIVE_REQUOTE_DECAY_WARN_BPS"), 1.0),
+            ),
+            live_initial_requote_gate_bps=to_float(
+                os.getenv("LIVE_INITIAL_REQUOTE_GATE_BPS"),
+                0.0,
+            ),
+            live_requote_decay_guard_trigger_bps=max(
+                0.0,
+                to_float(os.getenv("LIVE_REQUOTE_DECAY_GUARD_TRIGGER_BPS"), 12.0),
+            ),
+            live_requote_decay_guard_pause_seconds=max(
+                0.0,
+                to_float(os.getenv("LIVE_REQUOTE_DECAY_GUARD_PAUSE_SECONDS"), 60.0),
+            ),
+            live_requote_decay_guard_required_net_bps_boost=max(
+                0.0,
+                to_float(os.getenv("LIVE_REQUOTE_DECAY_GUARD_REQUIRED_NET_BPS_BOOST"), 3.0),
+            ),
+            live_single_tx_compact_requote_max_strategies=max(
+                1,
+                to_int(os.getenv("LIVE_SINGLE_TX_COMPACT_REQUOTE_MAX_STRATEGIES"), 1),
+            ),
+            live_initial_breakdown_log_interval_seconds=max(
+                0.0,
+                to_float(os.getenv("LIVE_INITIAL_BREAKDOWN_LOG_INTERVAL_SECONDS"), 5.0),
+            ),
+            live_edge_summary_window_seconds=max(
+                30.0,
+                to_float(os.getenv("LIVE_EDGE_SUMMARY_WINDOW_SECONDS"), 300.0),
+            ),
+            live_edge_summary_interval_seconds=max(
+                10.0,
+                to_float(os.getenv("LIVE_EDGE_SUMMARY_INTERVAL_SECONDS"), 300.0),
+            ),
+            live_edge_no_edge_window_seconds=max(
+                60.0,
+                to_float(os.getenv("LIVE_EDGE_NO_EDGE_WINDOW_SECONDS"), 3600.0),
+            ),
+            live_edge_consider_stop_window_seconds=max(
+                300.0,
+                to_float(os.getenv("LIVE_EDGE_CONSIDER_STOP_WINDOW_SECONDS"), 21600.0),
+            ),
+            live_edge_consider_stop_pass_rate_pct=max(
+                0.0,
+                to_float(os.getenv("LIVE_EDGE_CONSIDER_STOP_PASS_RATE_PCT"), 0.1),
+            ),
+            env_config_priority=normalize_env_config_priority(
+                os.getenv("ENV_CONFIG_PRIORITY", "firestore"),
             ),
         )

@@ -5,9 +5,11 @@ import base64
 import json
 import logging
 import random
+import time
 from dataclasses import replace
 from typing import Any
 
+from solders.address_lookup_table_account import AddressLookupTable
 from solders.address_lookup_table_account import AddressLookupTableAccount
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 from solders.hash import Hash
@@ -35,6 +37,7 @@ from .base_executors import (
     DryRunOrderExecutor,
     LiveOrderExecutor,
     RpcMethodError,
+    TransactionExpiredError,
     TransactionPendingConfirmationError,
     _error_payload_to_message,
     _is_retryable_rpc_error,
@@ -45,15 +48,26 @@ from .base_executors import (
 )
 from .types import (
     ExecutionResult,
+    FAIL_REASON_NOT_LANDED,
+    FAIL_REASON_PROBE_LIMIT_LOSS_LAMPORTS,
+    FAIL_REASON_PROBE_LIMIT_MAX_BASE_AMOUNT,
+    FAIL_REASON_PROBE_LIMIT_NEG_NET,
     OrderGuardStore,
     PairConfig,
     RuntimeConfig,
+    SpreadObservation,
     TradeIntent,
     make_order_id,
     normalize_atomic_send_mode,
+    to_float,
+    now_iso,
     to_int,
 )
 from .watcher import HeliusQuoteWatcher
+
+PROBE_MAX_NEG_NET_BPS = -0.5
+PROBE_MAX_LOSS_LAMPORTS = 5_000
+PROBE_MAX_BASE_AMOUNT_LAMPORTS = 200_000_000
 
 
 class LiveAtomicArbExecutor(LiveOrderExecutor):
@@ -81,6 +95,8 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         jito_block_engine_url: str = "",
         jito_tip_lamports_max: int = 100_000,
         jito_tip_lamports_recommended: int = 20_000,
+        single_tx_compact_requote_max_strategies: int = 1,
+        plan_quote_params: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             logger=logger,
@@ -105,10 +121,17 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         self._default_jito_block_engine_url = (jito_block_engine_url or "").strip()
         self._default_jito_tip_lamports_max = max(0, int(jito_tip_lamports_max))
         self._default_jito_tip_lamports_recommended = max(0, int(jito_tip_lamports_recommended))
+        self._single_tx_compact_requote_max_strategies = max(
+            1,
+            int(single_tx_compact_requote_max_strategies),
+        )
+        self._plan_quote_params = self._normalized_quote_params(plan_quote_params)
         self._atomic_planner = AtomicPlanner()
         self._atomic_builder = AtomicTransactionBuilder(logger=logger)
         self._bundle_rate_limited_count = 0
         self._bundle_backoff_until = 0.0
+        self._lookup_table_cache: dict[str, tuple[float, AddressLookupTableAccount]] = {}
+        self._lookup_table_cache_ttl_seconds = 300.0
         pending_manager = AtomicPendingManager(logger=logger, store=order_store)
         jito_client = JitoBlockEngineClient(logger=logger, block_engine_url=self._default_jito_block_engine_url)
         self._atomic_coordinator = AtomicExecutionCoordinator(
@@ -116,6 +139,9 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             pending_manager=pending_manager,
             jito_client=jito_client,
         )
+
+    def set_plan_quote_params(self, params: dict[str, Any] | None) -> None:
+        self._plan_quote_params = self._normalized_quote_params(params)
 
     async def connect(self) -> None:
         await super().connect()
@@ -160,6 +186,7 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         *,
         plan: Any,
         signed_transactions: list[str],
+        tip_lamports: int,
     ) -> str | None:
         if self._http_session is None:
             await self.connect()
@@ -173,6 +200,7 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     session=self._http_session,
                     plan=plan,
                     signed_transactions=signed_transactions,
+                    tip_lamports=tip_lamports,
                 )
             except JitoBundleRateLimitError:
                 raise
@@ -222,6 +250,188 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+
+    @staticmethod
+    def _extract_signature_from_signed_tx_base64(signed_tx_base64: str) -> str:
+        decoded = base64.b64decode(signed_tx_base64)
+        tx = VersionedTransaction.from_bytes(decoded)
+        if not tx.signatures:
+            raise RuntimeError("Signed transaction has no signatures.")
+        return str(tx.signatures[0])
+
+    @staticmethod
+    def _decode_system_transfer_lamports(signed_tx_base64: str) -> int:
+        decoded = base64.b64decode(signed_tx_base64)
+        tx = VersionedTransaction.from_bytes(decoded)
+        message = tx.message
+        account_keys = list(message.account_keys)
+        for compiled_instruction in message.instructions:
+            program_idx = int(compiled_instruction.program_id_index)
+            if program_idx < 0 or program_idx >= len(account_keys):
+                continue
+            if str(account_keys[program_idx]) != "11111111111111111111111111111111":
+                continue
+            instruction_data = bytes(compiled_instruction.data)
+            if len(instruction_data) < 12:
+                continue
+            instruction_kind = int.from_bytes(instruction_data[:4], "little", signed=False)
+            if instruction_kind != 2:
+                continue
+            return int.from_bytes(instruction_data[4:12], "little", signed=False)
+        return 0
+
+    @staticmethod
+    def _bundle_last_valid_block_height(
+        *,
+        last_valid_block_height_by_signature: dict[str, int | None],
+    ) -> int | None:
+        candidates = [
+            int(value)
+            for value in last_valid_block_height_by_signature.values()
+            if isinstance(value, int) and value >= 0
+        ]
+        return min(candidates) if candidates else None
+
+    async def _rebuild_bundle_artifact_with_fresh_blockhash(
+        self,
+        *,
+        plan: AtomicExecutionPlan,
+    ) -> AtomicBuildArtifact:
+        forward = await self._build_leg_transaction(
+            plan.forward_leg.quote_response,
+            plan.priority_fee_micro_lamports,
+        )
+        reverse = await self._build_leg_transaction(
+            plan.reverse_leg.quote_response,
+            plan.priority_fee_micro_lamports,
+        )
+
+        forward_signed = str(forward.get("signed_tx_base64") or "").strip()
+        reverse_signed = str(reverse.get("signed_tx_base64") or "").strip()
+        if not forward_signed or not reverse_signed:
+            raise RuntimeError("Bundle leg rebuild failed: signed transaction payload is missing.")
+        forward_last_valid = to_int(forward.get("last_valid_block_height"), -1)
+        reverse_last_valid = to_int(reverse.get("last_valid_block_height"), -1)
+
+        return AtomicBuildArtifact(
+            mode="bundle",
+            legs=[
+                BuiltAtomicLeg(
+                    leg="forward",
+                    signed_tx_base64=forward_signed,
+                    tx_signature=self._extract_signature_from_signed_tx_base64(forward_signed),
+                    latest_blockhash=str(forward.get("latest_blockhash") or ""),
+                    last_valid_block_height=forward_last_valid if forward_last_valid >= 0 else None,
+                ),
+                BuiltAtomicLeg(
+                    leg="reverse",
+                    signed_tx_base64=reverse_signed,
+                    tx_signature=self._extract_signature_from_signed_tx_base64(reverse_signed),
+                    latest_blockhash=str(reverse.get("latest_blockhash") or ""),
+                    last_valid_block_height=reverse_last_valid if reverse_last_valid >= 0 else None,
+                ),
+            ],
+        )
+
+    async def _poll_bundle_status(
+        self,
+        *,
+        plan_id: str,
+        bundle_id: str | None,
+        tx_signatures: list[str],
+    ) -> dict[str, Any] | None:
+        normalized_bundle_id = str(bundle_id or "").strip()
+        if not normalized_bundle_id:
+            return None
+        if self._http_session is None:
+            await self.connect()
+        if self._http_session is None:
+            return None
+
+        deadline = asyncio.get_running_loop().time() + min(30.0, max(6.0, self._confirm_timeout_seconds))
+        poll_interval_seconds = max(0.5, min(2.0, self._confirm_poll_interval_seconds))
+        terminal_statuses = {"landed", "finalized", "confirmed", "rejected", "dropped", "expired", "failed"}
+        last_snapshot: dict[str, Any] | None = None
+
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                snapshot = await self._atomic_coordinator.fetch_bundle_status(
+                    session=self._http_session,
+                    plan_id=plan_id,
+                    bundle_id=normalized_bundle_id,
+                )
+            except JitoBundleRateLimitError as error:
+                log_event(
+                    self._logger,
+                    level="warning",
+                    event="jito_bundle_status_poll_rate_limited",
+                    message="Jito bundle-status polling was rate-limited",
+                    plan_id=plan_id,
+                    bundle_id=normalized_bundle_id,
+                    retry_after_seconds=error.retry_after_seconds,
+                    tx_signatures=tx_signatures,
+                )
+                await asyncio.sleep(max(poll_interval_seconds, float(error.retry_after_seconds or 0.0)))
+                continue
+            except Exception as error:
+                log_event(
+                    self._logger,
+                    level="warning",
+                    event="jito_bundle_status_poll_failed",
+                    message="Jito bundle-status polling failed with a retryable error",
+                    plan_id=plan_id,
+                    bundle_id=normalized_bundle_id,
+                    error=str(error),
+                )
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+
+            if snapshot is not None:
+                last_snapshot = snapshot
+                status_text = str(snapshot.get("status") or "").strip().lower()
+                log_event(
+                    self._logger,
+                    level="info",
+                    event="jito_bundle_status",
+                    message="Jito bundle status snapshot",
+                    plan_id=plan_id,
+                    bundle_id=normalized_bundle_id,
+                    status=snapshot.get("status"),
+                    landed_slot=snapshot.get("landed_slot"),
+                    err=snapshot.get("err"),
+                    signatures=snapshot.get("signatures") or tx_signatures,
+                    method=snapshot.get("method"),
+                    endpoint=snapshot.get("endpoint"),
+                )
+                if status_text in terminal_statuses:
+                    return snapshot
+
+            await asyncio.sleep(poll_interval_seconds)
+
+        if last_snapshot is not None:
+            return last_snapshot
+
+        log_event(
+            self._logger,
+            level="warning",
+            event="jito_bundle_status",
+            message="Jito bundle status polling timed out without status payload",
+            plan_id=plan_id,
+            bundle_id=normalized_bundle_id,
+            status="unknown_timeout",
+            landed_slot=None,
+            err="bundle_status_unavailable",
+            signatures=tx_signatures,
+        )
+        return {
+            "bundle_id": normalized_bundle_id,
+            "status": "unknown_timeout",
+            "landed_slot": None,
+            "err": "bundle_status_unavailable",
+            "signatures": tx_signatures,
+            "method": None,
+            "endpoint": None,
+        }
 
     def _effective_runtime_config(self, runtime_config: RuntimeConfig) -> RuntimeConfig:
         atomic_send_mode = normalize_atomic_send_mode(
@@ -274,6 +484,69 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             quote_decimals=max(0, to_int(payload.get("quote_decimals"), 6)),
             base_amount=max(1, to_int(payload.get("base_amount"), intent.amount_in)),
             slippage_bps=max(1, to_int(payload.get("pair_slippage_bps"), 20)),
+        )
+
+    @staticmethod
+    def _to_string_tuple(value: Any) -> tuple[str, ...]:
+        if not isinstance(value, list):
+            return ()
+        items: list[str] = []
+        for raw in value:
+            normalized = str(raw or "").strip()
+            if normalized and normalized not in items:
+                items.append(normalized)
+        return tuple(items)
+
+    @classmethod
+    def _observation_from_metadata(
+        cls,
+        *,
+        pair: PairConfig,
+        metadata: dict[str, Any] | None,
+    ) -> SpreadObservation | None:
+        payload = metadata or {}
+        forward_quote = payload.get("forward_quote")
+        reverse_quote = payload.get("reverse_quote")
+        if not isinstance(forward_quote, dict) or not isinstance(reverse_quote, dict):
+            return None
+
+        forward_out_amount = to_int(payload.get("forward_out_amount"), 0)
+        reverse_out_amount = to_int(payload.get("reverse_out_amount"), 0)
+        if forward_out_amount <= 0:
+            forward_out_amount = to_int(forward_quote.get("outAmount"), 0)
+        if reverse_out_amount <= 0:
+            reverse_out_amount = to_int(reverse_quote.get("outAmount"), 0)
+        if forward_out_amount <= 0 or reverse_out_amount <= 0:
+            return None
+
+        spread_bps = to_float(
+            payload.get("spread_bps"),
+            ((reverse_out_amount - pair.base_amount) / pair.base_amount) * 10_000,
+        )
+        forward_price = to_float(payload.get("forward_price"), 0.0)
+
+        quote_params = cls._normalized_quote_params(payload.get("quote_params"))
+
+        return SpreadObservation(
+            pair=pair.symbol,
+            timestamp=str(payload.get("timestamp") or now_iso()),
+            forward_out_amount=forward_out_amount,
+            reverse_out_amount=reverse_out_amount,
+            forward_price=forward_price,
+            spread_bps=spread_bps,
+            forward_quote=forward_quote,
+            reverse_quote=reverse_quote,
+            quote_params=quote_params,
+            forward_route_dexes=cls._to_string_tuple(payload.get("forward_route_dexes")),
+            reverse_route_dexes=cls._to_string_tuple(payload.get("reverse_route_dexes")),
+            forward_route_hash=str(payload.get("forward_route_hash") or "").strip(),
+            reverse_route_hash=str(payload.get("reverse_route_hash") or "").strip(),
+            requote_samples_route_hashes_forward=cls._to_string_tuple(
+                payload.get("requote_samples_route_hashes_forward")
+            ),
+            requote_samples_route_hashes_reverse=cls._to_string_tuple(
+                payload.get("requote_samples_route_hashes_reverse")
+            ),
         )
 
     async def _build_leg_transaction(
@@ -413,6 +686,7 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         *,
         quote_response: dict[str, Any],
         priority_fee_micro_lamports: int,
+        as_legacy_transaction: bool = False,
     ) -> dict[str, Any]:
         if self._signer is None:
             await self.connect()
@@ -430,6 +704,8 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             "dynamicComputeUnitLimit": False,
             "prioritizationFeeLamports": max(0, int(priority_fee_micro_lamports)),
         }
+        if as_legacy_transaction:
+            payload["asLegacyTransaction"] = True
 
         try:
             async with self._http_session.post(
@@ -489,6 +765,42 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
 
         return parsed
 
+    async def _fetch_swap_instructions_payload_with_legacy_fallback(
+        self,
+        *,
+        quote_response: dict[str, Any],
+        priority_fee_micro_lamports: int,
+        enable_legacy_fallback: bool,
+        plan_id: str,
+        leg: str,
+        source: str,
+    ) -> dict[str, Any]:
+        try:
+            return await self._fetch_swap_instructions_payload(
+                quote_response=quote_response,
+                priority_fee_micro_lamports=priority_fee_micro_lamports,
+                as_legacy_transaction=False,
+            )
+        except Exception as primary_error:
+            if not enable_legacy_fallback:
+                raise
+
+            log_event(
+                self._logger,
+                level="warning",
+                event="atomic_swap_instructions_legacy_fallback",
+                message="swap-instructions failed; retrying with asLegacyTransaction=true",
+                plan_id=plan_id,
+                leg=leg,
+                source=source,
+                reason=str(primary_error),
+            )
+            return await self._fetch_swap_instructions_payload(
+                quote_response=quote_response,
+                priority_fee_micro_lamports=priority_fee_micro_lamports,
+                as_legacy_transaction=True,
+            )
+
     async def _fetch_latest_blockhash_with_height(self) -> tuple[str, int | None]:
         result = await self._rpc_call("getLatestBlockhash", [{"commitment": "processed"}])
         if not isinstance(result, dict):
@@ -512,61 +824,217 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         *,
         lookup_table_addresses: list[str],
     ) -> list[AddressLookupTableAccount]:
+        deduped_addresses: list[str] = []
+        for raw_address in lookup_table_addresses:
+            address = str(raw_address or "").strip()
+            if address and address not in deduped_addresses:
+                deduped_addresses.append(address)
+        if not deduped_addresses:
+            return []
+
+        now_epoch = time.time()
+        self._lookup_table_cache = {
+            address: (expires_at, account)
+            for address, (expires_at, account) in self._lookup_table_cache.items()
+            if expires_at > now_epoch
+        }
+
+        cached_accounts: dict[str, AddressLookupTableAccount] = {}
+        missing_addresses: list[str] = []
+        for lookup_table_address in deduped_addresses:
+            cached = self._lookup_table_cache.get(lookup_table_address)
+            if cached is None:
+                missing_addresses.append(lookup_table_address)
+                continue
+            cached_accounts[lookup_table_address] = cached[1]
+
+        if missing_addresses:
+            rpc_result = await self._rpc_call(
+                "getMultipleAccounts",
+                [
+                    missing_addresses,
+                    {"commitment": "processed", "encoding": "base64"},
+                ],
+            )
+            if not isinstance(rpc_result, dict):
+                raise RuntimeError(
+                    "Unexpected getMultipleAccounts response for lookup tables: "
+                    f"{rpc_result}"
+                )
+
+            raw_values = rpc_result.get("value")
+            if not isinstance(raw_values, list):
+                raise RuntimeError(
+                    "Missing value list in getMultipleAccounts lookup-table response: "
+                    f"{rpc_result}"
+                )
+            if len(raw_values) != len(missing_addresses):
+                raise RuntimeError(
+                    "Lookup-table response length mismatch: "
+                    f"requested={len(missing_addresses)} received={len(raw_values)}"
+                )
+
+            cache_expiry = now_epoch + self._lookup_table_cache_ttl_seconds
+            for lookup_table_address, raw_account in zip(missing_addresses, raw_values):
+                if raw_account is None:
+                    raise RuntimeError(f"Address lookup table account not found: {lookup_table_address}")
+                if not isinstance(raw_account, dict):
+                    raise RuntimeError(
+                        "Invalid lookup-table account payload for "
+                        f"{lookup_table_address}: {raw_account}"
+                    )
+
+                raw_data = raw_account.get("data")
+                encoded_data = ""
+                if isinstance(raw_data, list) and raw_data:
+                    encoded_data = str(raw_data[0] or "").strip()
+                elif isinstance(raw_data, str):
+                    encoded_data = raw_data.strip()
+                if not encoded_data:
+                    raise RuntimeError(
+                        "Lookup-table account data is missing for "
+                        f"{lookup_table_address}: {raw_account}"
+                    )
+
+                try:
+                    lut_bytes = base64.b64decode(encoded_data)
+                except Exception as error:
+                    raise RuntimeError(
+                        "Lookup-table account base64 decode failed for "
+                        f"{lookup_table_address}: {error}"
+                    ) from error
+
+                account = self._decode_lookup_table_account(
+                    lookup_table_address=lookup_table_address,
+                    lut_bytes=lut_bytes,
+                )
+                cached_accounts[lookup_table_address] = account
+                self._lookup_table_cache[lookup_table_address] = (cache_expiry, account)
+
         lookup_table_accounts: list[AddressLookupTableAccount] = []
-        for lookup_table_address in lookup_table_addresses:
-            result = await self._rpc_call(
-                "getAddressLookupTable",
-                [lookup_table_address, {"commitment": "processed"}],
-            )
-            if not isinstance(result, dict):
-                raise RuntimeError(
-                    "Unexpected getAddressLookupTable response "
-                    f"for {lookup_table_address}: {result}"
-                )
-            value = result.get("value")
-            if not isinstance(value, dict):
-                raise RuntimeError(f"Address lookup table not found: {lookup_table_address}")
-            raw_addresses = value.get("addresses")
-            if not isinstance(raw_addresses, list):
-                raise RuntimeError(
-                    "Address lookup table addresses are missing "
-                    f"for {lookup_table_address}: {value}"
-                )
-
-            lookup_table_accounts.append(
-                AddressLookupTableAccount(
-                    Pubkey.from_string(lookup_table_address),
-                    [
-                        Pubkey.from_string(str(raw_address))
-                        for raw_address in raw_addresses
-                        if str(raw_address or "").strip()
-                    ],
-                )
-            )
-
+        for lookup_table_address in deduped_addresses:
+            account = cached_accounts.get(lookup_table_address)
+            if account is None:
+                raise RuntimeError(f"Decoded lookup table cache miss: {lookup_table_address}")
+            lookup_table_accounts.append(account)
         return lookup_table_accounts
 
     @staticmethod
-    def _single_tx_compact_quote_strategies() -> list[tuple[str, dict[str, str]]]:
-        return [
+    def _collect_lookup_table_addresses(*payloads: Any) -> list[str]:
+        addresses: list[str] = []
+
+        def add(raw: Any) -> None:
+            address = str(raw or "").strip()
+            if address and address not in addresses:
+                addresses.append(address)
+
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            for key in ("addressLookupTableAddresses", "lookupTableAddresses"):
+                raw_values = payload.get(key)
+                if isinstance(raw_values, list):
+                    for raw_value in raw_values:
+                        add(raw_value)
+            raw_tables = payload.get("addressLookupTables")
+            if isinstance(raw_tables, list):
+                for raw_table in raw_tables:
+                    if isinstance(raw_table, dict):
+                        add(raw_table.get("address") or raw_table.get("pubkey"))
+                    else:
+                        add(raw_table)
+        return addresses
+
+    @staticmethod
+    def _decode_lookup_table_account(
+        *,
+        lookup_table_address: str,
+        lut_bytes: bytes,
+    ) -> AddressLookupTableAccount:
+        lookup_table_pubkey = Pubkey.from_string(lookup_table_address)
+
+        # Some providers can return serialized AddressLookupTableAccount bytes directly.
+        try:
+            decoded_account = AddressLookupTableAccount.from_bytes(lut_bytes)
+            if str(decoded_account.key) == lookup_table_address:
+                return decoded_account
+        except Exception:
+            pass
+
+        try:
+            decoded_table = AddressLookupTable.deserialize(lut_bytes)
+        except Exception:
+            decoded_table = AddressLookupTable.from_bytes(lut_bytes)
+
+        canonical_account = AddressLookupTableAccount(
+            lookup_table_pubkey,
+            list(decoded_table.addresses),
+        )
+        try:
+            return AddressLookupTableAccount.from_bytes(bytes(canonical_account))
+        except Exception:
+            return canonical_account
+
+    def _single_tx_compact_quote_strategies(self) -> list[tuple[str, dict[str, Any]]]:
+        strategies = [
             (
                 "direct_route_24",
                 {
-                    "onlyDirectRoutes": "true",
-                    "restrictIntermediateTokens": "true",
-                    "maxAccounts": "24",
+                    "onlyDirectRoutes": True,
+                    "restrictIntermediateTokens": True,
+                    "maxAccounts": 24,
                 },
             ),
             (
                 "restricted_28",
                 {
-                    "restrictIntermediateTokens": "true",
-                    "maxAccounts": "28",
+                    "restrictIntermediateTokens": True,
+                    "maxAccounts": 28,
                 },
             ),
-            ("max_accounts_24", {"maxAccounts": "24"}),
-            ("max_accounts_20", {"maxAccounts": "20"}),
+            ("max_accounts_24", {"maxAccounts": 24}),
+            ("max_accounts_20", {"maxAccounts": 20}),
         ]
+        return strategies[: self._single_tx_compact_requote_max_strategies]
+
+    @staticmethod
+    def _normalized_quote_params(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            if isinstance(raw_value, bool):
+                normalized[key] = raw_value
+                continue
+            if isinstance(raw_value, int):
+                normalized[key] = raw_value
+                continue
+            if isinstance(raw_value, float):
+                normalized[key] = int(raw_value) if raw_value.is_integer() else raw_value
+                continue
+            val = str(raw_value).strip()
+            if not val:
+                continue
+            lowered = val.lower()
+            if lowered in {"true", "false"}:
+                normalized[key] = lowered == "true"
+                continue
+            try:
+                normalized[key] = int(val)
+                continue
+            except ValueError:
+                pass
+            try:
+                parsed_float = float(val)
+                normalized[key] = int(parsed_float) if parsed_float.is_integer() else parsed_float
+                continue
+            except ValueError:
+                pass
+            normalized[key] = val
+        return normalized
 
     @staticmethod
     def _safe_forward_output_amount(quote: dict[str, Any]) -> int:
@@ -578,6 +1046,33 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             return out_amount
         return max(1, min(out_amount, min_out_amount))
 
+    @staticmethod
+    def _lamports_to_bps(*, lamports: int, notional_lamports: int) -> float:
+        if notional_lamports <= 0:
+            return 0.0
+        return (max(0, lamports) / notional_lamports) * 10_000
+
+    def _resolve_dynamic_tip_lamports(
+        self,
+        *,
+        expected_profit_lamports: int,
+        runtime_config: RuntimeConfig,
+    ) -> int:
+        if expected_profit_lamports <= 0:
+            return 0
+        tip_share = max(0.0, min(1.0, float(runtime_config.jito_tip_share)))
+        if tip_share <= 0:
+            return 0
+
+        tip_lamports = int(expected_profit_lamports * tip_share)
+        if tip_lamports <= 0:
+            tip_lamports = 1
+
+        max_tip = max(0, int(runtime_config.jito_tip_lamports_max))
+        if max_tip > 0:
+            tip_lamports = min(tip_lamports, max_tip)
+        return max(0, tip_lamports)
+
     async def _build_single_tx_from_quotes(
         self,
         *,
@@ -585,15 +1080,24 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         forward_quote: dict[str, Any],
         reverse_quote: dict[str, Any],
         source: str,
-        quote_strategy: dict[str, str] | None = None,
+        quote_strategy: dict[str, Any] | None = None,
+        enable_legacy_swap_fallback: bool = False,
     ) -> AtomicBuildArtifact:
-        forward_payload = await self._fetch_swap_instructions_payload(
+        forward_payload = await self._fetch_swap_instructions_payload_with_legacy_fallback(
             quote_response=forward_quote,
             priority_fee_micro_lamports=plan.priority_fee_micro_lamports,
+            enable_legacy_fallback=enable_legacy_swap_fallback,
+            plan_id=plan.plan_id,
+            leg="forward",
+            source=source,
         )
-        reverse_payload = await self._fetch_swap_instructions_payload(
+        reverse_payload = await self._fetch_swap_instructions_payload_with_legacy_fallback(
             quote_response=reverse_quote,
             priority_fee_micro_lamports=plan.priority_fee_micro_lamports,
+            enable_legacy_fallback=enable_legacy_swap_fallback,
+            plan_id=plan.plan_id,
+            leg="reverse",
+            source=source,
         )
 
         forward_instructions, forward_lookup_addresses = self._extract_leg_instructions(
@@ -611,10 +1115,14 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         if not execution_instructions:
             raise RuntimeError("single_tx build failed: no executable swap instructions were generated.")
 
-        lookup_addresses: list[str] = []
-        for lookup_table_address in [*forward_lookup_addresses, *reverse_lookup_addresses]:
-            if lookup_table_address not in lookup_addresses:
-                lookup_addresses.append(lookup_table_address)
+        lookup_addresses = self._collect_lookup_table_addresses(
+            {"addressLookupTableAddresses": forward_lookup_addresses},
+            {"addressLookupTableAddresses": reverse_lookup_addresses},
+            forward_payload,
+            reverse_payload,
+            forward_quote,
+            reverse_quote,
+        )
 
         lookup_table_accounts: list[AddressLookupTableAccount] = []
         if lookup_addresses:
@@ -624,7 +1132,7 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                 )
             except RpcMethodError as error:
                 if (
-                    error.method == "getAddressLookupTable"
+                    error.method in {"getMultipleAccounts", "getAccountInfo"}
                     and "method not found" in str(error).lower()
                 ):
                     log_event(
@@ -632,12 +1140,13 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                         level="warning",
                         event="atomic_lookup_table_rpc_unsupported",
                         message=(
-                            "RPC does not support getAddressLookupTable; "
+                            "RPC does not support lookup-table account reads via getMultipleAccounts; "
                             "retrying single_tx build without lookup tables"
                         ),
                         plan_id=plan.plan_id,
                         lookup_table_count=len(lookup_addresses),
                         rpc_status=error.status,
+                        rpc_method=error.method,
                         source=source,
                     )
                     lookup_table_accounts = []
@@ -663,10 +1172,26 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             raise RuntimeError("single_tx build failed: signed transaction has no signatures.")
 
         signed_tx_raw = bytes(signed_tx)
-        if len(signed_tx_raw) > 1232:
+        account_count = len(message.account_keys)
+        lookup_table_count = len(lookup_table_accounts)
+        lookup_table_requested_count = len(lookup_addresses)
+        tx_size_bytes = len(signed_tx_raw)
+        log_event(
+            self._logger,
+            level="info",
+            event="atomic_single_tx_build_metrics",
+            message="Atomic single_tx build metrics captured",
+            plan_id=plan.plan_id,
+            source=source,
+            tx_size_bytes=tx_size_bytes,
+            account_count=account_count,
+            lookup_table_count=lookup_table_count,
+            lookup_table_requested_count=lookup_table_requested_count,
+        )
+        if tx_size_bytes > 1232:
             raise RuntimeError(
                 "single_tx build produced an oversized transaction; "
-                f"size={len(signed_tx_raw)} bytes"
+                f"size={tx_size_bytes} bytes"
             )
 
         tx_signature = str(signed_tx.signatures[0])
@@ -680,9 +1205,10 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             source=source,
             quote_strategy=quote_strategy or {},
             instruction_count=len(execution_instructions),
-            lookup_table_count=len(lookup_table_accounts),
-            lookup_table_requested_count=len(lookup_addresses),
-            tx_size_bytes=len(signed_tx_raw),
+            lookup_table_count=lookup_table_count,
+            lookup_table_requested_count=lookup_table_requested_count,
+            tx_size_bytes=tx_size_bytes,
+            account_count=account_count,
             tx_signature=tx_signature,
         )
         return AtomicBuildArtifact(
@@ -702,27 +1228,48 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         self,
         *,
         plan: AtomicExecutionPlan,
+        enable_legacy_swap_fallback: bool = False,
     ) -> AtomicBuildArtifact:
+        plan_quote_params = dict(self._plan_quote_params)
+        if not plan_quote_params:
+            plan_quote_params = self._normalized_quote_params(plan.metadata.get("quote_params"))
+        forward_route_dexes = self._to_string_tuple(plan.metadata.get("forward_route_dexes"))
+        reverse_route_dexes = self._to_string_tuple(plan.metadata.get("reverse_route_dexes"))
+
+        forward_base_params = dict(plan_quote_params)
+        if forward_route_dexes and "dexes" not in forward_base_params:
+            forward_base_params["dexes"] = ",".join(forward_route_dexes)
+
+        reverse_base_params = dict(plan_quote_params)
+        if reverse_route_dexes and "dexes" not in reverse_base_params:
+            reverse_base_params["dexes"] = ",".join(reverse_route_dexes)
+
         last_error: Exception | None = None
         for strategy_name, strategy_params in self._single_tx_compact_quote_strategies():
             try:
+                forward_params = {**forward_base_params, **strategy_params}
                 forward_quote = await self._watcher.quote(
                     input_mint=plan.forward_leg.input_mint,
                     output_mint=plan.forward_leg.output_mint,
                     amount=plan.forward_leg.amount_in,
                     slippage_bps=plan.forward_leg.slippage_bps,
-                    extra_params=strategy_params,
+                    extra_params=forward_params,
+                    request_purpose="execution",
+                    allow_during_pause=True,
                 )
-                reusable_forward_out = self._safe_forward_output_amount(forward_quote)
+                reusable_forward_out = to_int(forward_quote.get("outAmount"), 0)
                 if reusable_forward_out <= 0:
                     raise RuntimeError("compact requote forward outAmount is missing.")
 
+                reverse_params = {**reverse_base_params, **strategy_params}
                 reverse_quote = await self._watcher.quote(
                     input_mint=plan.reverse_leg.input_mint,
                     output_mint=plan.reverse_leg.output_mint,
                     amount=reusable_forward_out,
                     slippage_bps=plan.reverse_leg.slippage_bps,
-                    extra_params=strategy_params,
+                    extra_params=reverse_params,
+                    request_purpose="execution",
+                    allow_during_pause=True,
                 )
                 reverse_out = to_int(reverse_quote.get("outAmount"), 0)
                 if reverse_out <= 0:
@@ -747,7 +1294,12 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     forward_quote=forward_quote,
                     reverse_quote=reverse_quote,
                     source=f"compact_requote:{strategy_name}",
-                    quote_strategy=strategy_params,
+                    quote_strategy={
+                        **strategy_params,
+                        "forward_route_locked": bool(forward_route_dexes),
+                        "reverse_route_locked": bool(reverse_route_dexes),
+                    },
+                    enable_legacy_swap_fallback=enable_legacy_swap_fallback,
                 )
             except asyncio.CancelledError:
                 raise
@@ -770,7 +1322,12 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             )
         raise RuntimeError("single_tx compact requote attempts were exhausted without a valid build.")
 
-    async def _build_single_tx_artifact(self, plan: AtomicExecutionPlan) -> AtomicBuildArtifact:
+    async def _build_single_tx_artifact(
+        self,
+        plan: AtomicExecutionPlan,
+        *,
+        runtime_config: RuntimeConfig,
+    ) -> AtomicBuildArtifact:
         if self._signer is None:
             await self.connect()
         if self._signer is None:
@@ -784,6 +1341,7 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     reverse_quote=plan.reverse_leg.quote_response,
                     source="plan_quote",
                     quote_strategy=None,
+                    enable_legacy_swap_fallback=bool(runtime_config.enable_legacy_swap_fallback),
                 )
             except Exception as error:
                 if "oversized transaction" not in str(error).lower():
@@ -798,6 +1356,7 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                 )
                 return await self._build_single_tx_with_compact_requote(
                     plan=plan,
+                    enable_legacy_swap_fallback=bool(runtime_config.enable_legacy_swap_fallback),
                 )
         except asyncio.CancelledError:
             raise
@@ -834,7 +1393,7 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         except Exception as error:
             raise RuntimeError(f"Invalid Jito tip account returned: {tip_account_raw}") from error
 
-        latest_blockhash = await self._fetch_latest_blockhash()
+        latest_blockhash, tip_last_valid_block_height = await self._fetch_latest_blockhash_with_height()
         instruction = transfer(
             TransferParams(
                 from_pubkey=self._signer.pubkey(),
@@ -851,14 +1410,28 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
         signed_tip_tx = VersionedTransaction(message, [self._signer])
         if not signed_tip_tx.signatures:
             raise RuntimeError("Failed to build Jito tip transaction signature.")
+        signed_tx_base64 = base64.b64encode(bytes(signed_tip_tx)).decode("ascii")
+        tip_tx_signature = str(signed_tip_tx.signatures[0])
+        decoded_tip_lamports = self._decode_system_transfer_lamports(signed_tx_base64)
+        log_event(
+            self._logger,
+            level="info",
+            event="jito_tip_tx_decoded",
+            message="Decoded Jito tip transfer from signed tip transaction",
+            plan_id=plan_id,
+            tip_tx_signature=tip_tx_signature,
+            tip_account=str(tip_account),
+            decoded_tip_lamports=decoded_tip_lamports,
+        )
 
         return {
-            "signed_tx_base64": base64.b64encode(bytes(signed_tip_tx)).decode("ascii"),
-            "tx_signature": str(signed_tip_tx.signatures[0]),
+            "signed_tx_base64": signed_tx_base64,
+            "tx_signature": tip_tx_signature,
             "tip_account": str(tip_account),
             "latest_blockhash": latest_blockhash,
-            "last_valid_block_height": None,
+            "last_valid_block_height": tip_last_valid_block_height,
             "tip_lamports": max(0, int(tip_lamports)),
+            "decoded_tip_lamports": max(0, int(decoded_tip_lamports)),
         }
 
     async def execute(
@@ -957,19 +1530,51 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             )
 
             pair = self._pair_from_metadata(intent, metadata)
-            refreshed_observation = await self._atomic_planner.refresh_observation(
-                quote_callable=self._watcher.quote,
-                pair=pair,
-            )
+            seed_observation = self._observation_from_metadata(pair=pair, metadata=metadata)
+            plan_observation = seed_observation
+            plan_observation_source = "seed_observation"
+            if plan_observation is None:
+                plan_observation = await self._atomic_planner.refresh_observation(
+                    quote_callable=self._watcher.quote,
+                    pair=pair,
+                    seed_observation=None,
+                    override_quote_params=(self._plan_quote_params or None),
+                )
+                plan_observation_source = "planner_requote_fallback"
+                log_event(
+                    self._logger,
+                    level="warning",
+                    event="atomic_plan_route_lock_fallback",
+                    message=(
+                        "Plan metadata did not include reusable quote payloads; "
+                        "falling back to planner requote."
+                    ),
+                    pair=pair.symbol,
+                )
             plan = self._atomic_planner.build_plan(
                 idempotency_key=idempotency_key,
                 pair=pair,
-                observation=refreshed_observation,
+                observation=plan_observation,
                 runtime_config=runtime_config,
                 priority_fee_micro_lamports=priority_fee_micro_lamports,
             )
 
             current_plan_id = plan.plan_id
+            compact_metadata = {
+                **compact_metadata,
+                "plan_forward_route_hash": str(
+                    plan.metadata.get("forward_route_hash")
+                    or plan_observation.forward_route_hash
+                    or ""
+                ),
+                "plan_reverse_route_hash": str(
+                    plan.metadata.get("reverse_route_hash")
+                    or plan_observation.reverse_route_hash
+                    or ""
+                ),
+                "plan_spread_bps": float(plan.expected_spread_bps),
+                "plan_observation_source": plan_observation_source,
+            }
 
             if plan.send_mode == "bundle":
                 now = asyncio.get_running_loop().time()
@@ -1069,8 +1674,28 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             artifact = await self._atomic_builder.build(
                 plan=plan,
                 build_leg_tx=self._build_leg_transaction,
-                build_single_tx=self._build_single_tx_artifact,
+                build_single_tx=lambda dynamic_plan: self._build_single_tx_artifact(
+                    dynamic_plan,
+                    runtime_config=runtime_config,
+                ),
             )
+            allow_stageb_fail_probe = bool(runtime_config.allow_stageb_fail_probe)
+            metadata_stage_b_pass = metadata.get("stage_b_pass") if isinstance(metadata, dict) else None
+            metadata_is_probe_trade = metadata.get("is_probe_trade") if isinstance(metadata, dict) else None
+            inferred_is_probe_trade = (
+                allow_stageb_fail_probe
+                and (
+                    metadata_is_probe_trade is True
+                    or metadata_stage_b_pass is False
+                )
+            )
+            effective_bundle_tip_lamports = 0
+            effective_required_spread_bps = float(plan.required_spread_bps)
+            effective_expected_fee_bps = float(plan.expected_fee_bps)
+            effective_expected_net_bps = float(plan.expected_net_bps)
+            effective_expected_net_lamports = int(plan.expected_net_lamports)
+            bundle_tip_fee_bps = 0.0
+            is_probe_trade = inferred_is_probe_trade
 
             if plan.is_expired():
                 skip_reason = "Atomic plan expired before network submission"
@@ -1103,9 +1728,356 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     },
                 )
 
+            if artifact.mode == "bundle":
+                now = asyncio.get_running_loop().time()
+                remaining_bundle_backoff = self._bundle_backoff_until - now
+                if remaining_bundle_backoff > 0:
+                    retry_after_seconds = round(max(0.0, remaining_bundle_backoff), 3)
+                    skip_reason = "Bundle submission is cooling down after Jito rate limit"
+                    await _record_order_state(
+                        order_store=self._order_store,
+                        order_id=order_id,
+                        status="rate_limited",
+                        ttl_seconds=record_ttl_seconds,
+                        guard_key=idempotency_key,
+                        payload={
+                            "plan_id": plan.plan_id,
+                            "error": skip_reason,
+                            "retry_after_seconds": retry_after_seconds,
+                            "bundle_backoff_seconds": retry_after_seconds,
+                            "auto_fallback_bundle": plan.send_mode == "auto",
+                        },
+                        logger=self._logger,
+                        event="atomic_record_rate_limited_failed",
+                    )
+                    return ExecutionResult(
+                        status="rate_limited",
+                        tx_signature=None,
+                        priority_fee_micro_lamports=priority_fee_micro_lamports,
+                        reason=skip_reason,
+                        order_id=order_id,
+                        idempotency_key=idempotency_key,
+                        metadata={
+                            **compact_metadata,
+                            "plan_id": plan.plan_id,
+                            "rate_limited": True,
+                            "retry_after_seconds": retry_after_seconds,
+                            "bundle_backoff_seconds": retry_after_seconds,
+                            "auto_fallback_bundle": plan.send_mode == "auto",
+                        },
+                    )
+
+            if artifact.mode == "bundle":
+                expected_profit_lamports = max(0, int(effective_expected_net_lamports))
+                effective_bundle_tip_lamports = self._resolve_dynamic_tip_lamports(
+                    expected_profit_lamports=expected_profit_lamports,
+                    runtime_config=runtime_config,
+                )
+                if effective_bundle_tip_lamports <= 0:
+                    skip_reason = "Dynamic tip resolved to zero for bundle mode"
+                    log_event(
+                        self._logger,
+                        level="info",
+                        event="atomic_bundle_tip_zero",
+                        message="Atomic bundle submission skipped because dynamic tip resolved to zero",
+                        plan_id=plan.plan_id,
+                        expected_profit_lamports=expected_profit_lamports,
+                        tip_share=round(float(runtime_config.jito_tip_share), 6),
+                        tip_lamports_effective=effective_bundle_tip_lamports,
+                        tip_fee_bps_effective=0.0,
+                        max_tip_lamports=int(runtime_config.jito_tip_lamports_max),
+                    )
+                    await _record_order_state(
+                        order_store=self._order_store,
+                        order_id=order_id,
+                        status="skipped_bundle_tip_zero",
+                        ttl_seconds=record_ttl_seconds,
+                        guard_key=idempotency_key,
+                        payload={
+                            "plan_id": plan.plan_id,
+                            "expected_profit_lamports": expected_profit_lamports,
+                            "tip_share": runtime_config.jito_tip_share,
+                            "tip_lamports_effective": effective_bundle_tip_lamports,
+                            "tip_fee_bps_effective": 0.0,
+                            "max_tip_lamports": runtime_config.jito_tip_lamports_max,
+                        },
+                        logger=self._logger,
+                        event="atomic_record_skip_bundle_tip_zero_failed",
+                    )
+                    return ExecutionResult(
+                        status="skipped_bundle_tip_zero",
+                        tx_signature=None,
+                        priority_fee_micro_lamports=priority_fee_micro_lamports,
+                        reason=skip_reason,
+                        order_id=order_id,
+                        idempotency_key=idempotency_key,
+                        metadata={
+                            **compact_metadata,
+                            "plan_id": plan.plan_id,
+                            "expected_profit_lamports": expected_profit_lamports,
+                            "tip_share": runtime_config.jito_tip_share,
+                            "tip_lamports_effective": effective_bundle_tip_lamports,
+                            "tip_fee_bps_effective": 0.0,
+                            "max_tip_lamports": runtime_config.jito_tip_lamports_max,
+                            "resolved_mode": artifact.mode,
+                        },
+                    )
+
+                bundle_tip_fee_bps = self._lamports_to_bps(
+                    lamports=effective_bundle_tip_lamports,
+                    notional_lamports=plan.forward_leg.amount_in,
+                )
+                effective_required_spread_bps += bundle_tip_fee_bps
+                effective_expected_fee_bps += bundle_tip_fee_bps
+                effective_expected_net_bps = plan.expected_spread_bps - effective_required_spread_bps
+                effective_expected_net_lamports = int(
+                    (plan.forward_leg.amount_in * effective_expected_net_bps) / 10_000
+                )
+                if allow_stageb_fail_probe and effective_expected_net_bps < 0:
+                    is_probe_trade = True
+
+            if allow_stageb_fail_probe and effective_expected_net_bps < 0:
+                is_probe_trade = True
+
+            if is_probe_trade:
+                if int(plan.forward_leg.amount_in) > PROBE_MAX_BASE_AMOUNT_LAMPORTS:
+                    skip_reason = (
+                        f"Probe trade exceeds max base amount limit: "
+                        f"base_amount={int(plan.forward_leg.amount_in)} "
+                        f"limit={PROBE_MAX_BASE_AMOUNT_LAMPORTS}"
+                    )
+                    await _record_order_state(
+                        order_store=self._order_store,
+                        order_id=order_id,
+                        status="skipped_probe_limit_max_base_amount",
+                        ttl_seconds=record_ttl_seconds,
+                        guard_key=idempotency_key,
+                        payload={
+                            "plan_id": plan.plan_id,
+                            "base_amount_lamports": int(plan.forward_leg.amount_in),
+                            "probe_max_base_amount_lamports": PROBE_MAX_BASE_AMOUNT_LAMPORTS,
+                            "fail_reason": FAIL_REASON_PROBE_LIMIT_MAX_BASE_AMOUNT,
+                        },
+                        logger=self._logger,
+                        event="atomic_record_skip_probe_limit_failed",
+                    )
+                    return ExecutionResult(
+                        status="skipped_probe_limit_max_base_amount",
+                        tx_signature=None,
+                        priority_fee_micro_lamports=priority_fee_micro_lamports,
+                        reason=skip_reason,
+                        order_id=order_id,
+                        idempotency_key=idempotency_key,
+                        metadata={
+                            **compact_metadata,
+                            "plan_id": plan.plan_id,
+                            "is_probe_trade": True,
+                            "fail_reason": FAIL_REASON_PROBE_LIMIT_MAX_BASE_AMOUNT,
+                            "base_amount_lamports": int(plan.forward_leg.amount_in),
+                            "probe_max_base_amount_lamports": PROBE_MAX_BASE_AMOUNT_LAMPORTS,
+                        },
+                    )
+                if effective_expected_net_bps < PROBE_MAX_NEG_NET_BPS:
+                    skip_reason = (
+                        f"Probe trade expected net bps below limit: "
+                        f"net_bps={round(effective_expected_net_bps, 6)} "
+                        f"limit={PROBE_MAX_NEG_NET_BPS}"
+                    )
+                    await _record_order_state(
+                        order_store=self._order_store,
+                        order_id=order_id,
+                        status="skipped_probe_limit_neg_net",
+                        ttl_seconds=record_ttl_seconds,
+                        guard_key=idempotency_key,
+                        payload={
+                            "plan_id": plan.plan_id,
+                            "expected_net_bps": effective_expected_net_bps,
+                            "probe_max_neg_net_bps": PROBE_MAX_NEG_NET_BPS,
+                            "fail_reason": FAIL_REASON_PROBE_LIMIT_NEG_NET,
+                        },
+                        logger=self._logger,
+                        event="atomic_record_skip_probe_limit_failed",
+                    )
+                    return ExecutionResult(
+                        status="skipped_probe_limit_neg_net",
+                        tx_signature=None,
+                        priority_fee_micro_lamports=priority_fee_micro_lamports,
+                        reason=skip_reason,
+                        order_id=order_id,
+                        idempotency_key=idempotency_key,
+                        metadata={
+                            **compact_metadata,
+                            "plan_id": plan.plan_id,
+                            "is_probe_trade": True,
+                            "fail_reason": FAIL_REASON_PROBE_LIMIT_NEG_NET,
+                            "expected_net_bps": effective_expected_net_bps,
+                            "probe_max_neg_net_bps": PROBE_MAX_NEG_NET_BPS,
+                        },
+                    )
+                if effective_expected_net_lamports < -PROBE_MAX_LOSS_LAMPORTS:
+                    skip_reason = (
+                        f"Probe trade expected loss exceeds lamports limit: "
+                        f"net_lamports={int(effective_expected_net_lamports)} "
+                        f"limit={-PROBE_MAX_LOSS_LAMPORTS}"
+                    )
+                    await _record_order_state(
+                        order_store=self._order_store,
+                        order_id=order_id,
+                        status="skipped_probe_limit_loss_lamports",
+                        ttl_seconds=record_ttl_seconds,
+                        guard_key=idempotency_key,
+                        payload={
+                            "plan_id": plan.plan_id,
+                            "expected_net_lamports": int(effective_expected_net_lamports),
+                            "probe_max_loss_lamports": PROBE_MAX_LOSS_LAMPORTS,
+                            "fail_reason": FAIL_REASON_PROBE_LIMIT_LOSS_LAMPORTS,
+                        },
+                        logger=self._logger,
+                        event="atomic_record_skip_probe_limit_failed",
+                    )
+                    return ExecutionResult(
+                        status="skipped_probe_limit_loss_lamports",
+                        tx_signature=None,
+                        priority_fee_micro_lamports=priority_fee_micro_lamports,
+                        reason=skip_reason,
+                        order_id=order_id,
+                        idempotency_key=idempotency_key,
+                        metadata={
+                            **compact_metadata,
+                            "plan_id": plan.plan_id,
+                            "is_probe_trade": True,
+                            "fail_reason": FAIL_REASON_PROBE_LIMIT_LOSS_LAMPORTS,
+                            "expected_net_lamports": int(effective_expected_net_lamports),
+                            "probe_max_loss_lamports": PROBE_MAX_LOSS_LAMPORTS,
+                        },
+                    )
+
             if (
                 artifact.mode == "bundle"
-                and plan.expected_net_bps < runtime_config.atomic_bundle_min_expected_net_bps
+                and effective_expected_net_bps < (
+                    PROBE_MAX_NEG_NET_BPS if is_probe_trade else 0.0
+                )
+            ):
+                skip_reason = "Expected net spread turned negative after bundle tip inclusion"
+                log_event(
+                    self._logger,
+                    level="info",
+                    event="atomic_bundle_unprofitable_with_tip",
+                    message="Atomic bundle submission skipped because effective net spread is negative",
+                    plan_id=plan.plan_id,
+                    expected_net_bps=round(effective_expected_net_bps, 6),
+                    required_spread_bps=round(effective_required_spread_bps, 6),
+                    observed_spread_bps=round(plan.expected_spread_bps, 6),
+                    tip_lamports=effective_bundle_tip_lamports,
+                    tip_fee_bps=round(bundle_tip_fee_bps, 6),
+                    tip_lamports_effective=effective_bundle_tip_lamports,
+                    tip_fee_bps_effective=round(bundle_tip_fee_bps, 6),
+                    send_mode_requested=plan.send_mode,
+                )
+                await _record_order_state(
+                    order_store=self._order_store,
+                    order_id=order_id,
+                    status="skipped_bundle_unprofitable_with_tip",
+                    ttl_seconds=record_ttl_seconds,
+                    guard_key=idempotency_key,
+                    payload={
+                        "plan_id": plan.plan_id,
+                        "expected_net_bps": effective_expected_net_bps,
+                        "required_spread_bps": effective_required_spread_bps,
+                        "observed_spread_bps": plan.expected_spread_bps,
+                        "tip_lamports": effective_bundle_tip_lamports,
+                        "tip_fee_bps": bundle_tip_fee_bps,
+                        "tip_lamports_effective": effective_bundle_tip_lamports,
+                        "tip_fee_bps_effective": bundle_tip_fee_bps,
+                    },
+                    logger=self._logger,
+                    event="atomic_record_skip_bundle_unprofitable_failed",
+                )
+                return ExecutionResult(
+                    status="skipped_bundle_unprofitable_with_tip",
+                    tx_signature=None,
+                    priority_fee_micro_lamports=priority_fee_micro_lamports,
+                    reason=skip_reason,
+                    order_id=order_id,
+                    idempotency_key=idempotency_key,
+                    metadata={
+                        **compact_metadata,
+                        "plan_id": plan.plan_id,
+                        "is_probe_trade": bool(is_probe_trade),
+                        "expected_net_bps": effective_expected_net_bps,
+                        "required_spread_bps": effective_required_spread_bps,
+                        "observed_spread_bps": plan.expected_spread_bps,
+                        "tip_lamports": effective_bundle_tip_lamports,
+                        "tip_fee_bps": bundle_tip_fee_bps,
+                        "tip_lamports_effective": effective_bundle_tip_lamports,
+                        "tip_fee_bps_effective": bundle_tip_fee_bps,
+                        "resolved_mode": artifact.mode,
+                    },
+                )
+
+            min_expected_profit_limit = (
+                -PROBE_MAX_LOSS_LAMPORTS
+                if is_probe_trade
+                else int(runtime_config.min_expected_profit_lamports)
+            )
+            if effective_expected_net_lamports < min_expected_profit_limit:
+                skip_reason = "Expected net profit is below minimum execution threshold"
+                log_event(
+                    self._logger,
+                    level="info",
+                    event="atomic_execution_min_profit_not_met",
+                    message="Atomic execution skipped because expected net profit is below minimum threshold",
+                    plan_id=plan.plan_id,
+                    mode=artifact.mode,
+                    expected_net_lamports=int(effective_expected_net_lamports),
+                    required_min_profit_lamports=int(min_expected_profit_limit),
+                    expected_net_bps=round(effective_expected_net_bps, 6),
+                    is_probe_trade=bool(is_probe_trade),
+                    tip_lamports_effective=effective_bundle_tip_lamports,
+                    tip_fee_bps_effective=round(bundle_tip_fee_bps, 6),
+                )
+                await _record_order_state(
+                    order_store=self._order_store,
+                    order_id=order_id,
+                    status="skipped_min_expected_profit",
+                    ttl_seconds=record_ttl_seconds,
+                    guard_key=idempotency_key,
+                    payload={
+                        "plan_id": plan.plan_id,
+                        "mode": artifact.mode,
+                        "expected_net_lamports": int(effective_expected_net_lamports),
+                        "required_min_profit_lamports": int(min_expected_profit_limit),
+                        "expected_net_bps": effective_expected_net_bps,
+                        "is_probe_trade": bool(is_probe_trade),
+                        "tip_lamports_effective": effective_bundle_tip_lamports,
+                        "tip_fee_bps_effective": bundle_tip_fee_bps,
+                    },
+                    logger=self._logger,
+                    event="atomic_record_skip_min_profit_failed",
+                )
+                return ExecutionResult(
+                    status="skipped_min_expected_profit",
+                    tx_signature=None,
+                    priority_fee_micro_lamports=priority_fee_micro_lamports,
+                    reason=skip_reason,
+                    order_id=order_id,
+                    idempotency_key=idempotency_key,
+                    metadata={
+                        **compact_metadata,
+                        "plan_id": plan.plan_id,
+                        "mode": artifact.mode,
+                        "expected_net_lamports": int(effective_expected_net_lamports),
+                        "required_min_profit_lamports": int(min_expected_profit_limit),
+                        "expected_net_bps": effective_expected_net_bps,
+                        "is_probe_trade": bool(is_probe_trade),
+                        "tip_lamports_effective": effective_bundle_tip_lamports,
+                        "tip_fee_bps_effective": bundle_tip_fee_bps,
+                    },
+                )
+
+            if (
+                artifact.mode == "bundle"
+                and effective_expected_net_bps < runtime_config.atomic_bundle_min_expected_net_bps
             ):
                 skip_reason = "Expected net spread is too thin for bundle submission"
                 log_event(
@@ -1114,8 +2086,12 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     event="atomic_bundle_thin_opportunity_skipped",
                     message="Atomic bundle submission skipped due to thin expected net spread",
                     plan_id=plan.plan_id,
-                    expected_net_bps=round(plan.expected_net_bps, 6),
+                    expected_net_bps=round(effective_expected_net_bps, 6),
                     required_min_net_bps=round(runtime_config.atomic_bundle_min_expected_net_bps, 6),
+                    tip_lamports=effective_bundle_tip_lamports,
+                    tip_fee_bps=round(bundle_tip_fee_bps, 6),
+                    tip_lamports_effective=effective_bundle_tip_lamports,
+                    tip_fee_bps_effective=round(bundle_tip_fee_bps, 6),
                     send_mode_requested=plan.send_mode,
                 )
                 await _record_order_state(
@@ -1126,8 +2102,12 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     guard_key=idempotency_key,
                     payload={
                         "plan_id": plan.plan_id,
-                        "expected_net_bps": plan.expected_net_bps,
+                        "expected_net_bps": effective_expected_net_bps,
                         "required_min_net_bps": runtime_config.atomic_bundle_min_expected_net_bps,
+                        "tip_lamports": effective_bundle_tip_lamports,
+                        "tip_fee_bps": bundle_tip_fee_bps,
+                        "tip_lamports_effective": effective_bundle_tip_lamports,
+                        "tip_fee_bps_effective": bundle_tip_fee_bps,
                     },
                     logger=self._logger,
                     event="atomic_record_skip_bundle_thin_failed",
@@ -1142,8 +2122,12 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     metadata={
                         **compact_metadata,
                         "plan_id": plan.plan_id,
-                        "expected_net_bps": plan.expected_net_bps,
+                        "expected_net_bps": effective_expected_net_bps,
                         "required_min_net_bps": runtime_config.atomic_bundle_min_expected_net_bps,
+                        "tip_lamports": effective_bundle_tip_lamports,
+                        "tip_fee_bps": bundle_tip_fee_bps,
+                        "tip_lamports_effective": effective_bundle_tip_lamports,
+                        "tip_fee_bps_effective": bundle_tip_fee_bps,
                         "resolved_mode": artifact.mode,
                     },
                 )
@@ -1153,11 +2137,73 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
             last_valid_block_height_by_signature = {
                 leg.tx_signature: leg.last_valid_block_height for leg in artifact.legs
             }
+            bundle_last_valid_block_height = self._bundle_last_valid_block_height(
+                last_valid_block_height_by_signature=last_valid_block_height_by_signature
+            )
             signed_transactions: list[str] = []
             tip_tx_signature: str | None = None
             tip_account: str | None = None
+            decoded_tip_lamports = 0
 
             if artifact.mode == "bundle":
+                current_block_height = await self._fetch_block_height()
+                freshness_delta = (
+                    bundle_last_valid_block_height - current_block_height
+                    if bundle_last_valid_block_height is not None
+                    else None
+                )
+                log_event(
+                    self._logger,
+                    level="info",
+                    event="tx_blockhash_freshness",
+                    message="Bundle blockhash freshness snapshot before submission",
+                    plan_id=plan.plan_id,
+                    current_block_height=current_block_height,
+                    bundle_last_valid_block_height=bundle_last_valid_block_height,
+                    delta=freshness_delta,
+                    stage="pre_submit",
+                )
+                if (
+                    bundle_last_valid_block_height is not None
+                    and freshness_delta is not None
+                    and freshness_delta < 20
+                ):
+                    log_event(
+                        self._logger,
+                        level="warning",
+                        event="tx_blockhash_refresh_rebuild",
+                        message="Bundle blockhash window is too tight; rebuilding legs with fresh blockhash",
+                        plan_id=plan.plan_id,
+                        current_block_height=current_block_height,
+                        bundle_last_valid_block_height=bundle_last_valid_block_height,
+                        delta=freshness_delta,
+                    )
+                    artifact = await self._rebuild_bundle_artifact_with_fresh_blockhash(plan=plan)
+                    tx_signatures = artifact.tx_signatures()
+                    last_valid_block_height_by_signature = {
+                        leg.tx_signature: leg.last_valid_block_height for leg in artifact.legs
+                    }
+                    bundle_last_valid_block_height = self._bundle_last_valid_block_height(
+                        last_valid_block_height_by_signature=last_valid_block_height_by_signature
+                    )
+                    refreshed_current_block_height = await self._fetch_block_height()
+                    refreshed_delta = (
+                        bundle_last_valid_block_height - refreshed_current_block_height
+                        if bundle_last_valid_block_height is not None
+                        else None
+                    )
+                    log_event(
+                        self._logger,
+                        level="info",
+                        event="tx_blockhash_freshness",
+                        message="Bundle blockhash freshness snapshot after rebuild",
+                        plan_id=plan.plan_id,
+                        current_block_height=refreshed_current_block_height,
+                        bundle_last_valid_block_height=bundle_last_valid_block_height,
+                        delta=refreshed_delta,
+                        stage="post_rebuild",
+                    )
+
                 if self._http_session is None:
                     await self.connect()
                 if self._http_session is None:
@@ -1166,17 +2212,69 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                 signed_transactions = [leg.signed_tx_base64 for leg in artifact.legs]
 
                 tip_tx = await self._build_jito_tip_transaction(
-                    tip_lamports=plan.tip_lamports,
+                    tip_lamports=effective_bundle_tip_lamports,
                     plan_id=plan.plan_id,
                 )
                 tip_tx_signature = str(tip_tx.get("tx_signature") or "").strip()
                 if not tip_tx_signature:
                     raise RuntimeError("Failed to build Jito tip transaction signature.")
                 tip_account = str(tip_tx.get("tip_account") or "").strip() or None
+                decoded_tip_lamports = max(0, to_int(tip_tx.get("decoded_tip_lamports"), 0))
+                if decoded_tip_lamports <= 0:
+                    skip_reason = "TIP_ZERO"
+                    log_event(
+                        self._logger,
+                        level="warning",
+                        event="jito_tip_missing_or_zero",
+                        message="Decoded tip transfer amount is missing or zero; skipping bundle submission",
+                        plan_id=plan.plan_id,
+                        fail_reason="TIP_ZERO",
+                        tip_tx_signature=tip_tx_signature,
+                        tip_account=tip_account,
+                        tip_lamports=effective_bundle_tip_lamports,
+                        decoded_tip_lamports=decoded_tip_lamports,
+                    )
+                    await _record_order_state(
+                        order_store=self._order_store,
+                        order_id=order_id,
+                        status="skipped_bundle_tip_zero",
+                        ttl_seconds=record_ttl_seconds,
+                        guard_key=idempotency_key,
+                        payload={
+                            "plan_id": plan.plan_id,
+                            "fail_reason": "TIP_ZERO",
+                            "tip_lamports": effective_bundle_tip_lamports,
+                            "tip_tx_signature": tip_tx_signature,
+                            "tip_account": tip_account,
+                            "decoded_tip_lamports": decoded_tip_lamports,
+                        },
+                        logger=self._logger,
+                        event="atomic_record_skip_bundle_tip_zero_failed",
+                    )
+                    return ExecutionResult(
+                        status="skipped_bundle_tip_zero",
+                        tx_signature=None,
+                        priority_fee_micro_lamports=priority_fee_micro_lamports,
+                        reason=skip_reason,
+                        order_id=order_id,
+                        idempotency_key=idempotency_key,
+                        metadata={
+                            **compact_metadata,
+                            "plan_id": plan.plan_id,
+                            "fail_reason": "TIP_ZERO",
+                            "tip_lamports": effective_bundle_tip_lamports,
+                            "tip_tx_signature": tip_tx_signature,
+                            "tip_account": tip_account,
+                            "decoded_tip_lamports": decoded_tip_lamports,
+                        },
+                    )
 
                 signed_transactions.append(str(tip_tx["signed_tx_base64"]))
                 tx_signatures.append(tip_tx_signature)
                 last_valid_block_height_by_signature[tip_tx_signature] = tip_tx.get("last_valid_block_height")
+                bundle_last_valid_block_height = self._bundle_last_valid_block_height(
+                    last_valid_block_height_by_signature=last_valid_block_height_by_signature
+                )
 
             submitted_tx_signatures = list(tx_signatures)
 
@@ -1190,6 +2288,8 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     "builder_mode": artifact.mode,
                     "tip_tx_signature": tip_tx_signature,
                     "tip_account": tip_account,
+                    "decoded_tip_lamports": decoded_tip_lamports,
+                    "bundle_last_valid_block_height": bundle_last_valid_block_height,
                 },
             )
 
@@ -1203,11 +2303,15 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     "plan_id": plan.plan_id,
                     "mode": artifact.mode,
                     "tx_signatures": tx_signatures,
-                    "expected_net_bps": plan.expected_net_bps,
-                    "expected_fee_bps": plan.expected_fee_bps,
-                    "tip_lamports": plan.tip_lamports,
+                    "expected_net_bps": effective_expected_net_bps,
+                    "expected_fee_bps": effective_expected_fee_bps,
+                    "tip_lamports": effective_bundle_tip_lamports,
+                    "tip_lamports_effective": effective_bundle_tip_lamports,
+                    "tip_fee_bps_effective": bundle_tip_fee_bps,
                     "tip_tx_signature": tip_tx_signature,
                     "tip_account": tip_account,
+                    "decoded_tip_lamports": decoded_tip_lamports,
+                    "bundle_last_valid_block_height": bundle_last_valid_block_height,
                 },
                 logger=self._logger,
                 event="atomic_record_submitted_failed",
@@ -1221,11 +2325,15 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                 plan_id=plan.plan_id,
                 mode=artifact.mode,
                 send_mode_requested=plan.send_mode,
-                expected_net_bps=round(plan.expected_net_bps, 6),
-                expected_fee_bps=round(plan.expected_fee_bps, 6),
-                tip_lamports=plan.tip_lamports,
+                expected_net_bps=round(effective_expected_net_bps, 6),
+                expected_fee_bps=round(effective_expected_fee_bps, 6),
+                tip_lamports=effective_bundle_tip_lamports,
+                tip_lamports_effective=effective_bundle_tip_lamports,
+                tip_fee_bps_effective=round(bundle_tip_fee_bps, 6),
                 tip_tx_signature=tip_tx_signature,
                 tip_account=tip_account,
+                decoded_tip_lamports=decoded_tip_lamports,
+                bundle_last_valid_block_height=bundle_last_valid_block_height,
                 tx_signatures=tx_signatures,
             )
 
@@ -1252,8 +2360,62 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                 bundle_id = await self._submit_bundle_with_retry(
                     plan=plan,
                     signed_transactions=signed_transactions,
+                    tip_lamports=effective_bundle_tip_lamports,
                 )
                 self._reset_bundle_rate_limit_backoff()
+                bundle_status_snapshot = await self._poll_bundle_status(
+                    plan_id=plan.plan_id,
+                    bundle_id=bundle_id,
+                    tx_signatures=tx_signatures,
+                )
+                status_text = str(
+                    (bundle_status_snapshot or {}).get("status") or ""
+                ).strip().lower()
+                if status_text in {"rejected", "dropped", "expired", "failed", "invalid"}:
+                    not_landed_reason = f"NOT_LANDED:{status_text or 'unknown'}"
+                    await self._atomic_coordinator.pending_manager.mark_failed(
+                        plan_id=plan.plan_id,
+                        order_id=order_id,
+                        guard_key=idempotency_key,
+                        tx_signatures=tx_signatures,
+                        ttl_seconds=record_ttl_seconds,
+                        payload={
+                            "bundle_id": bundle_id,
+                            "bundle_status": bundle_status_snapshot,
+                            "fail_reason": FAIL_REASON_NOT_LANDED,
+                        },
+                    )
+                    await _record_order_state(
+                        order_store=self._order_store,
+                        order_id=order_id,
+                        status="not_landed",
+                        ttl_seconds=record_ttl_seconds,
+                        guard_key=idempotency_key,
+                        payload={
+                            "plan_id": plan.plan_id,
+                            "bundle_id": bundle_id,
+                            "bundle_status": bundle_status_snapshot,
+                            "fail_reason": FAIL_REASON_NOT_LANDED,
+                        },
+                        logger=self._logger,
+                        event="atomic_record_not_landed_failed",
+                    )
+                    return ExecutionResult(
+                        status="not_landed",
+                        tx_signature=None,
+                        priority_fee_micro_lamports=priority_fee_micro_lamports,
+                        reason=not_landed_reason,
+                        order_id=order_id,
+                        idempotency_key=idempotency_key,
+                        metadata={
+                            **compact_metadata,
+                            "plan_id": plan.plan_id,
+                            "bundle_id": bundle_id,
+                            "bundle_status": bundle_status_snapshot,
+                            "fail_reason": FAIL_REASON_NOT_LANDED,
+                            "tx_signatures": tx_signatures,
+                        },
+                    )
 
             confirmations = await self._wait_for_atomic_confirmations(
                 tx_signatures=tx_signatures,
@@ -1269,11 +2431,16 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                 payload={
                     "bundle_id": bundle_id,
                     "confirmations": confirmations,
-                    "expected_net_bps": plan.expected_net_bps,
-                    "expected_fee_bps": plan.expected_fee_bps,
-                    "tip_lamports": plan.tip_lamports,
+                    "expected_net_bps": effective_expected_net_bps,
+                    "expected_fee_bps": effective_expected_fee_bps,
+                    "tip_lamports": effective_bundle_tip_lamports,
+                    "tip_lamports_effective": effective_bundle_tip_lamports,
+                    "tip_fee_bps_effective": bundle_tip_fee_bps,
                     "tip_tx_signature": tip_tx_signature,
                     "tip_account": tip_account,
+                    "decoded_tip_lamports": decoded_tip_lamports,
+                    "bundle_last_valid_block_height": bundle_last_valid_block_height,
+                    "is_probe_trade": bool(is_probe_trade),
                 },
             )
 
@@ -1285,13 +2452,18 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                 "tx_signatures": tx_signatures,
                 "bundle_id": bundle_id,
                 "confirmations": confirmations,
-                "expected_net_bps": plan.expected_net_bps,
-                "expected_net_lamports": plan.expected_net_lamports,
-                "expected_fee_bps": plan.expected_fee_bps,
-                "tip_lamports": plan.tip_lamports,
+                "expected_net_bps": effective_expected_net_bps,
+                "expected_net_lamports": effective_expected_net_lamports,
+                "expected_fee_bps": effective_expected_fee_bps,
+                "tip_lamports": effective_bundle_tip_lamports,
+                "tip_lamports_effective": effective_bundle_tip_lamports,
+                "tip_fee_bps_effective": bundle_tip_fee_bps,
                 "tip_tx_signature": tip_tx_signature,
                 "tip_account": tip_account,
-                "required_spread_bps": plan.required_spread_bps,
+                "decoded_tip_lamports": decoded_tip_lamports,
+                "bundle_last_valid_block_height": bundle_last_valid_block_height,
+                "is_probe_trade": bool(is_probe_trade),
+                "required_spread_bps": effective_required_spread_bps,
                 "observed_spread_bps": plan.expected_spread_bps,
                 "expires_at_ms": plan.expires_at_ms,
                 "confirmed": True,
@@ -1306,11 +2478,15 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                 mode=artifact.mode,
                 bundle_id=bundle_id,
                 tx_signatures=tx_signatures,
-                expected_net_bps=round(plan.expected_net_bps, 6),
-                expected_fee_bps=round(plan.expected_fee_bps, 6),
-                tip_lamports=plan.tip_lamports,
+                expected_net_bps=round(effective_expected_net_bps, 6),
+                expected_fee_bps=round(effective_expected_fee_bps, 6),
+                tip_lamports=effective_bundle_tip_lamports,
+                tip_lamports_effective=effective_bundle_tip_lamports,
+                tip_fee_bps_effective=round(bundle_tip_fee_bps, 6),
                 tip_tx_signature=tip_tx_signature,
                 tip_account=tip_account,
+                decoded_tip_lamports=decoded_tip_lamports,
+                bundle_last_valid_block_height=bundle_last_valid_block_height,
                 confirmed=True,
             )
 
@@ -1373,6 +2549,70 @@ class LiveAtomicArbExecutor(LiveOrderExecutor):
                     ),
                     "bundle_backoff_seconds": backoff_seconds,
                     "tx_signatures": submitted_tx_signatures,
+                },
+            )
+        except TransactionExpiredError as error:
+            not_landed_reason = "NOT_LANDED:expired_before_confirmation"
+            if current_plan_id != "unknown":
+                await self._atomic_coordinator.pending_manager.mark_failed(
+                    plan_id=current_plan_id,
+                    order_id=order_id,
+                    guard_key=idempotency_key,
+                    tx_signatures=submitted_tx_signatures,
+                    ttl_seconds=record_ttl_seconds,
+                    payload={
+                        "error": str(error),
+                        "bundle_id": bundle_id,
+                        "bundle_last_valid_block_height": bundle_last_valid_block_height,
+                        "fail_reason": FAIL_REASON_NOT_LANDED,
+                    },
+                )
+            await _record_order_state(
+                order_store=self._order_store,
+                order_id=order_id,
+                status="not_landed",
+                ttl_seconds=record_ttl_seconds,
+                guard_key=idempotency_key,
+                payload={
+                    "plan_id": current_plan_id,
+                    "bundle_id": bundle_id,
+                    "tx_signatures": submitted_tx_signatures,
+                    "error": str(error),
+                    "bundle_last_valid_block_height": bundle_last_valid_block_height,
+                    "fail_reason": FAIL_REASON_NOT_LANDED,
+                },
+                logger=self._logger,
+                event="atomic_record_not_landed_failed",
+            )
+            log_event(
+                self._logger,
+                level="warning",
+                event="atomic_confirmation_expired_not_landed",
+                message=(
+                    "Atomic confirmation expired before observation; "
+                    "marking as not_landed and skipping execution-error escalation"
+                ),
+                plan_id=current_plan_id,
+                bundle_id=bundle_id,
+                tx_signatures=submitted_tx_signatures,
+                error=str(error),
+                fail_reason=FAIL_REASON_NOT_LANDED,
+            )
+            return ExecutionResult(
+                status="not_landed",
+                tx_signature=None,
+                priority_fee_micro_lamports=priority_fee_micro_lamports,
+                reason=not_landed_reason,
+                order_id=order_id,
+                idempotency_key=idempotency_key,
+                metadata={
+                    **compact_metadata,
+                    "plan_id": current_plan_id,
+                    "bundle_id": bundle_id,
+                    "tx_signatures": submitted_tx_signatures,
+                    "error": str(error),
+                    "bundle_last_valid_block_height": bundle_last_valid_block_height,
+                    "fail_reason": FAIL_REASON_NOT_LANDED,
                 },
             )
         except TransactionPendingConfirmationError as error:

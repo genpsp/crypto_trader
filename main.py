@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import signal
 from typing import Any
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -32,13 +34,165 @@ async def main() -> None:
     pair = PairConfig.from_env()
     runtime_defaults = RuntimeConfig.from_env_defaults()
 
+    log_event(
+        logger,
+        level="info",
+        event="effective_config_dump_startup",
+        message="Startup effective config from environment defaults",
+        config_priority=app_settings.env_config_priority,
+        runtime_transport="startup_env",
+        TRADE_ENABLED=runtime_defaults.trade_enabled,
+        TRADE_ENABLED_source="env",
+        trade_enabled=runtime_defaults.trade_enabled,
+        trade_enabled_source="env",
+        ATOMIC_SEND_MODE=runtime_defaults.atomic_send_mode,
+        ATOMIC_SEND_MODE_source="env",
+        ATOMIC_EXPIRY_MS=runtime_defaults.atomic_expiry_ms,
+        ATOMIC_EXPIRY_MS_source="env",
+        MIN_SPREAD_BPS=runtime_defaults.min_spread_bps,
+        MIN_SPREAD_BPS_source="env",
+        INITIAL_MIN_SPREAD_BPS=runtime_defaults.initial_min_spread_bps,
+        INITIAL_MIN_SPREAD_BPS_source="env",
+        ATOMIC_MARGIN_BPS=runtime_defaults.atomic_margin_bps,
+        ATOMIC_MARGIN_BPS_source="env",
+        INITIAL_ATOMIC_MARGIN_BPS=runtime_defaults.initial_atomic_margin_bps,
+        INITIAL_ATOMIC_MARGIN_BPS_source="env",
+        MIN_STAGEA_MARGIN_BPS=runtime_defaults.min_stagea_margin_bps,
+        MIN_STAGEA_MARGIN_BPS_source="env",
+        PRIORITY_FEE_MICRO_LAMPORTS=runtime_defaults.priority_fee_micro_lamports,
+        PRIORITY_FEE_MICRO_LAMPORTS_source="env",
+        PRIORITY_COMPUTE_UNITS=runtime_defaults.priority_compute_units,
+        PRIORITY_COMPUTE_UNITS_source="env",
+        JITO_TIP_LAMPORTS_MAX=runtime_defaults.jito_tip_lamports_max,
+        JITO_TIP_LAMPORTS_MAX_source="env",
+        JITO_TIP_LAMPORTS_RECOMMENDED=runtime_defaults.jito_tip_lamports_recommended,
+        JITO_TIP_LAMPORTS_RECOMMENDED_source="env",
+        JITO_TIP_SHARE=runtime_defaults.jito_tip_share,
+        JITO_TIP_SHARE_source="env",
+        BASE_AMOUNT_SWEEP_CANDIDATES_RAW=list(runtime_defaults.base_amount_sweep_candidates_raw),
+        BASE_AMOUNT_SWEEP_CANDIDATES_RAW_source="env",
+        BASE_AMOUNT_MAX_RAW=runtime_defaults.base_amount_max_raw,
+        BASE_AMOUNT_MAX_RAW_source="env",
+        PAIR_BASE_AMOUNT=pair.base_amount,
+        PAIR_BASE_AMOUNT_source="env",
+        QUOTE_MAX_RPS=runtime_defaults.quote_max_rps,
+        QUOTE_MAX_RPS_source="env",
+        QUOTE_EXPLORATION_MAX_RPS=runtime_defaults.quote_exploration_max_rps,
+        QUOTE_EXPLORATION_MAX_RPS_source="env",
+        QUOTE_EXECUTION_MAX_RPS=runtime_defaults.quote_execution_max_rps,
+        QUOTE_EXECUTION_MAX_RPS_source="env",
+        QUOTE_EXPLORATION_MODE=runtime_defaults.quote_exploration_mode,
+        QUOTE_EXPLORATION_MODE_source="env",
+        ENABLE_PROBE_MULTI_AMOUNT=runtime_defaults.enable_probe_multi_amount,
+        ENABLE_PROBE_MULTI_AMOUNT_source="env",
+        ENABLE_PROBE_UNCONSTRAINED=runtime_defaults.enable_probe_unconstrained,
+        ENABLE_PROBE_UNCONSTRAINED_source="env",
+        QUOTE_DEX_SWEEP_TOPK=runtime_defaults.quote_dex_sweep_topk,
+        QUOTE_DEX_SWEEP_TOPK_source="env",
+        QUOTE_DEX_SWEEP_COMBO_LIMIT=runtime_defaults.quote_dex_sweep_combo_limit,
+        QUOTE_DEX_SWEEP_COMBO_LIMIT_source="env",
+        MAX_REQUOTE_RANGE_BPS=runtime_defaults.max_requote_range_bps,
+        MAX_REQUOTE_RANGE_BPS_source="env",
+    )
+
+    def normalize_quote_params(payload: Any) -> dict[str, str | int | float | bool]:
+        if not isinstance(payload, dict):
+            return {}
+        normalized: dict[str, str | int | float | bool] = {}
+        for raw_key, raw_value in payload.items():
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            if isinstance(raw_value, bool):
+                normalized[key] = raw_value
+                continue
+            if isinstance(raw_value, int):
+                normalized[key] = raw_value
+                continue
+            if isinstance(raw_value, float):
+                normalized[key] = int(raw_value) if raw_value.is_integer() else raw_value
+                continue
+            value = str(raw_value).strip()
+            if not value:
+                continue
+            lowered = value.lower()
+            if lowered in {"true", "false"}:
+                normalized[key] = lowered == "true"
+                continue
+            with contextlib.suppress(ValueError):
+                normalized[key] = int(value)
+                continue
+            with contextlib.suppress(ValueError):
+                parsed_float = float(value)
+                normalized[key] = int(parsed_float) if parsed_float.is_integer() else parsed_float
+                continue
+            normalized[key] = value
+        return normalized
+
+    def parse_quote_params(raw: str, *, event: str, label: str) -> dict[str, str | int | float | bool]:
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            log_event(
+                logger,
+                level="warning",
+                event=event,
+                message=f"{label} is invalid JSON; ignoring params",
+            )
+            return {}
+        normalized = normalize_quote_params(parsed)
+        if not normalized:
+            return {}
+        return normalized
+
+    quote_default_params = parse_quote_params(
+        app_settings.quote_default_params_json,
+        event="quote_default_params_invalid_json",
+        label="QUOTE_DEFAULT_PARAMS_JSON",
+    )
+    quote_initial_params = parse_quote_params(
+        app_settings.quote_initial_params_json,
+        event="quote_initial_params_invalid_json",
+        label="QUOTE_INITIAL_PARAMS_JSON",
+    )
+    quote_plan_params = parse_quote_params(
+        app_settings.quote_plan_params_json,
+        event="quote_plan_params_invalid_json",
+        label="QUOTE_PLAN_PARAMS_JSON",
+    )
+
+    if not quote_initial_params:
+        quote_initial_params = dict(quote_default_params)
+    if not quote_plan_params:
+        quote_plan_params = dict(quote_default_params)
+
+    quote_api_base = app_settings.helius_quote_api
+    parsed_quote_api = urlsplit(quote_api_base)
+    if (
+        not app_settings.helius_jup_proxy_enabled
+        and "helius-rpc.com" in parsed_quote_api.netloc.lower()
+        and "/jup-proxy/" in parsed_quote_api.path
+    ):
+        quote_api_base = "https://api.jup.ag/swap/v1/quote"
+        log_event(
+            logger,
+            level="info",
+            event="quote_provider_aligned",
+            message="Helius jup-proxy is disabled; forcing Jupiter direct quote endpoint",
+            configured_quote_api=app_settings.helius_quote_api,
+            active_quote_api=quote_api_base,
+        )
+
     storage = StorageGateway(storage_settings, logger)
     watcher = HeliusQuoteWatcher(
         logger=logger,
-        api_base_url=app_settings.helius_quote_api,
+        api_base_url=quote_api_base,
         api_key=app_settings.helius_api_key or None,
         jupiter_api_key=app_settings.jupiter_api_key or None,
         enable_helius_jup_proxy=app_settings.helius_jup_proxy_enabled,
+        default_quote_params=quote_initial_params,
     )
     if app_settings.dry_run:
         executor: DryRunOrderExecutor | LiveOrderExecutor | LiveAtomicArbExecutor = DryRunOrderExecutor(
@@ -69,6 +223,10 @@ async def main() -> None:
                 jito_block_engine_url=app_settings.jito_block_engine_url,
                 jito_tip_lamports_max=app_settings.jito_tip_lamports_max,
                 jito_tip_lamports_recommended=app_settings.jito_tip_lamports_recommended,
+                single_tx_compact_requote_max_strategies=(
+                    app_settings.live_single_tx_compact_requote_max_strategies
+                ),
+                plan_quote_params=quote_plan_params,
             )
         else:
             executor = LiveOrderExecutor(

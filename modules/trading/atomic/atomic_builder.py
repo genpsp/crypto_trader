@@ -50,6 +50,15 @@ class AtomicTransactionBuilder:
                     plan_id=plan.plan_id,
                     reason=str(error),
                 )
+                log_event(
+                    self._logger,
+                    level="warning",
+                    event="atomic_fallback_to_bundle",
+                    message="Falling back to bundle mode because single_tx build was unavailable",
+                    plan_id=plan.plan_id,
+                    send_mode_requested=plan.send_mode,
+                    reason=str(error),
+                )
 
         return await self._build_bundle(plan=plan, build_leg_tx=build_leg_tx)
 

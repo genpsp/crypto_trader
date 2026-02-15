@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from typing import Any
 
 from redis.asyncio.client import Redis
@@ -424,6 +425,63 @@ class RedisStorageOps:
     async def update_heartbeat(self) -> None:
         redis_client = self._require_redis()
         await redis_client.set(self.settings.heartbeat_key, _now_iso())
+
+    async def set_rate_limit_pause_until(self, *, pause_until_epoch: float) -> None:
+        redis_client = self._require_redis()
+        normalized_pause_until = max(0.0, float(pause_until_epoch))
+        remaining_seconds = max(0.0, normalized_pause_until - time.time())
+        ttl_seconds = max(60, int(remaining_seconds) + 60)
+        await redis_client.set(
+            self.settings.rate_limit_pause_key,
+            f"{normalized_pause_until:.6f}",
+            ex=ttl_seconds,
+        )
+
+    async def get_rate_limit_pause_until(self) -> float:
+        redis_client = self._require_redis()
+        raw = await redis_client.get(self.settings.rate_limit_pause_key)
+        if raw is None:
+            return 0.0
+        try:
+            return max(0.0, float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def increment_runtime_counters(self, *, counters: dict[str, int]) -> None:
+        if not counters:
+            return
+        redis_client = self._require_redis()
+        counter_key = self.settings.runtime_counter_key
+        pipeline = redis_client.pipeline(transaction=True)
+        for name, delta in counters.items():
+            metric = str(name).strip()
+            if not metric:
+                continue
+            increment = int(delta)
+            if increment == 0:
+                continue
+            pipeline.hincrby(counter_key, metric, increment)
+        if self.settings.runtime_metrics_ttl_seconds > 0:
+            pipeline.expire(counter_key, self.settings.runtime_metrics_ttl_seconds)
+        await pipeline.execute()
+
+    async def set_runtime_summary(self, *, values: dict[str, Any]) -> None:
+        if not values:
+            return
+        redis_client = self._require_redis()
+        summary_key = self.settings.runtime_summary_key
+        payload = {
+            str(key): _serialize_for_redis(value)
+            for key, value in values.items()
+            if str(key).strip()
+        }
+        if not payload:
+            return
+        pipeline = redis_client.pipeline(transaction=True)
+        pipeline.hset(summary_key, mapping=payload)
+        if self.settings.runtime_metrics_ttl_seconds > 0:
+            pipeline.expire(summary_key, self.settings.runtime_metrics_ttl_seconds)
+        await pipeline.execute()
 
     def _require_redis(self) -> Redis:
         if self._redis is None:
